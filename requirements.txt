@@ -19,6 +19,7 @@ nest-asyncio==1.6.0
 numpy==2.4.6
 packaging==26.2
 pandas==3.0.3
+torch
 parso==0.8.7
 pexpect==4.9.0
 pillow==12.2.0
@@ -32,6 +33,9 @@ pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 pyzmq==27.1.0
 seaborn==0.13.2
+scikit-learn
+joblib
+xgboost
 six==1.17.0
 stack-data==0.6.3
 tornado==6.5.5
