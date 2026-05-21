@@ -28,7 +28,7 @@ OBS: features terminadas em CH - home team win odd, CD - draft odd, CA - away te
 
  - serao analisadas as saidas da rede para classificacao do confronto (time da casa, empate, time de fora) e a regressao de gols para o time da casa e time de fora 
  - alem da analise dos resultados serao analisadas metricas de relevancia para as features presentes a fim de verificar padroes; alem da analise da regra de bolso empirica (quantas linhas por feature ate meu modelo piorar)
- - serao utilizadas taticas de sepraćão de dataset em treino e validacao com 5 inicializacoes de 10 folds pr cda treino
+ - serao utilizadas taticas de sepraćão de dataset em treino e validacao com 5 inicializacoes diferentes para verificar a estabilidade dos resultados
 
 A divisao de sećões para o relatorio será:
 
