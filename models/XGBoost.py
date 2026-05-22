@@ -1,23 +1,40 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from joblib import dump
-from xgboost import DMatrix, XGBClassifier, XGBRegressor, train  # type: ignore[import-not-found]
-from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error
+import xgboost as xgb  # type: ignore[import-not-found]
 
 try:
     from .dataloader import CLASS_LABEL_MAP, FEATURE_COLUMNS, load_match_dataframe, split_match_dataframe
-except ImportError:  # pragma: no cover - fallback when run as a standalone script
+except ImportError:  # pragma: no cover
     from dataloader import CLASS_LABEL_MAP, FEATURE_COLUMNS, load_match_dataframe, split_match_dataframe
 
 
 YEAR_COLUMN = "ano_campeonato"
 INV_CLASS_LABEL_MAP = {0: -1, 1: 0, 2: 1}
 TARGET_COLUMNS = ("resultado_partida", "gols_mandante", "gols_visitante")
+
+
+@dataclass(frozen=True)
+class TrainedModels:
+    classifier: xgb.Booster
+    regressor_home: xgb.Booster
+    regressor_away: xgb.Booster
+
+
+@dataclass(frozen=True)
+class ModelMetrics:
+    accuracy: float
+    mae_home: float
+    mae_away: float
+    rmse_home: float
+    rmse_away: float
 
 
 def _prepare_xy(dataframe: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -29,54 +46,34 @@ def _prepare_xy(dataframe: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.nda
     return x_values, y_class, y_home_goals, y_away_goals
 
 
-def _train_booster(
-    *,
-    params: dict[str, Any],
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    x_val: np.ndarray,
-    y_val: np.ndarray,
-    n_estimators: int,
-    early_stopping_rounds: int,
-) -> Any:
-    dtrain = DMatrix(x_train, label=y_train)
-    dval = DMatrix(x_val, label=y_val)
-    booster = train(
-        params=params,
-        dtrain=dtrain,
-        num_boost_round=n_estimators,
-        evals=[(dval, "validation")],
-        early_stopping_rounds=early_stopping_rounds,
-        verbose_eval=False,
-    )
-    return booster
+def _compute_metrics_from_preds(
+    y_true_cls: np.ndarray, y_pred_cls: np.ndarray,
+    y_true_home: np.ndarray, y_pred_home: np.ndarray,
+    y_true_away: np.ndarray, y_pred_away: np.ndarray,
+) -> ModelMetrics:
+    # Substituindo sklearn por numpy puro para remover dependências externas externas
+    acc = float(np.mean(y_true_cls == y_pred_cls))
+    mae_h = float(np.mean(np.abs(y_true_home - y_pred_home)))
+    mae_a = float(np.mean(np.abs(y_true_away - y_pred_away)))
+    rmse_h = float(np.sqrt(np.mean((y_true_home - y_pred_home) ** 2)))
+    rmse_a = float(np.sqrt(np.mean((y_true_away - y_pred_away) ** 2)))
+    return ModelMetrics(accuracy=acc, mae_home=mae_h, mae_away=mae_a, rmse_home=rmse_h, rmse_away=rmse_a)
 
 
-def _predict_classifier(model: Any, features: np.ndarray) -> np.ndarray:
-    dmatrix = DMatrix(features)
-    if getattr(model, "best_iteration", None) is not None:
-        return np.asarray(model.predict(dmatrix, iteration_range=(0, model.best_iteration + 1)))
-    return np.asarray(model.predict(dmatrix))
+def _predict_booster(model: xgb.Booster, dmatrix: xgb.DMatrix, is_classifier: bool = False) -> np.ndarray:
+    # O XGBoost usa automaticamente a melhor iteração salva se early_stopping foi ativado
+    predictions = model.predict(dmatrix)
+    if is_classifier:
+        return predictions.argmax(axis=1).astype(np.int64)
+    return np.asarray(predictions)
 
 
-def _predict_regressor(model: Any, features: np.ndarray) -> np.ndarray:
-    dmatrix = DMatrix(features)
-    if getattr(model, "best_iteration", None) is not None:
-        return np.asarray(model.predict(dmatrix, iteration_range=(0, model.best_iteration + 1)))
-    return np.asarray(model.predict(dmatrix))
-
-
-def _build_validation_predictions(
-    validation_dataframe: pd.DataFrame,
-    predicted_class_labels: np.ndarray,
-    predicted_home_goals: np.ndarray,
-    predicted_away_goals: np.ndarray,
-) -> pd.DataFrame:
-    predicted_frame = validation_dataframe.copy()
-    predicted_frame["pred_resultado_partida"] = [INV_CLASS_LABEL_MAP[int(label)] for label in predicted_class_labels]
-    predicted_frame["pred_gols_mandante"] = predicted_home_goals.astype(float)
-    predicted_frame["pred_gols_visitante"] = predicted_away_goals.astype(float)
-    return predicted_frame
+def _save_checkpoints(result: dict[str, Any], save_path: str | Path | None, best_model_path: str | Path | None) -> None:
+    checkpoint_paths = [path for path in (save_path, best_model_path) if path is not None]
+    for checkpoint_path in checkpoint_paths:
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        dump(result, checkpoint_path)
 
 
 def train_model(
@@ -94,6 +91,8 @@ def train_model(
     best_model_path: str | Path | None = None,
     validation_predictions_path: str | Path = Path(__file__).resolve().parents[0] / "results" / "respostas_xgboost.csv",
 ) -> dict[str, Any]:
+    
+    # Stage 1: load and split
     dataframe = load_match_dataframe(csv_path)
     splits = split_match_dataframe(dataframe)
 
@@ -104,9 +103,21 @@ def train_model(
     if len(x_val) == 0:
         raise ValueError("validation split is empty; check the year reconstruction logic before training")
 
-    classifier_params = {
-        "objective": "multi:softprob",
-        "num_class": 3,
+    # Montando as DMatrices estruturadas
+    dtrain_cls = xgb.DMatrix(x_train, label=y_train_cls)
+    dtrain_home = xgb.DMatrix(x_train, label=y_train_home)
+    dtrain_away = xgb.DMatrix(x_train, label=y_train_away)
+    
+    dval_cls = xgb.DMatrix(x_val, label=y_val_cls)
+    dval_home = xgb.DMatrix(x_val, label=y_val_home)
+    dval_away = xgb.DMatrix(x_val, label=y_val_away)
+    
+    dtest_cls = xgb.DMatrix(x_test)
+    dtest_home = xgb.DMatrix(x_test)
+    dtest_away = xgb.DMatrix(x_test)
+
+    # Parâmetros base compartilhados
+    base_params = {
         "max_depth": max_depth,
         "eta": learning_rate,
         "subsample": subsample,
@@ -115,90 +126,86 @@ def train_model(
         "lambda": reg_lambda,
         "seed": random_state,
         "tree_method": "hist",
-        "eval_metric": "mlogloss",
-    }
-    regressor_params = {
-        "objective": "reg:squarederror",
-        "max_depth": max_depth,
-        "eta": learning_rate,
-        "subsample": subsample,
-        "colsample_bytree": colsample_bytree,
-        "alpha": reg_alpha,
-        "lambda": reg_lambda,
-        "seed": random_state,
-        "tree_method": "hist",
-        "eval_metric": "rmse",
     }
 
-    classifier = _train_booster(
-        params=classifier_params,
-        x_train=x_train,
-        y_train=y_train_cls,
-        x_val=x_val,
-        y_val=y_val_cls,
-        n_estimators=n_estimators,
-        early_stopping_rounds=early_stopping_rounds,
-    )
-    regressor_home = _train_booster(
-        params=regressor_params,
-        x_train=x_train,
-        y_train=y_train_home,
-        x_val=x_val,
-        y_val=y_val_home,
-        n_estimators=n_estimators,
-        early_stopping_rounds=early_stopping_rounds,
-    )
-    regressor_away = _train_booster(
-        params=regressor_params,
-        x_train=x_train,
-        y_train=y_train_away,
-        x_val=x_val,
-        y_val=y_val_away,
-        n_estimators=n_estimators,
-        early_stopping_rounds=early_stopping_rounds,
+    # 1. Defina a função de decaimento (ex: decaimento de 5% a cada 100 rodadas)
+    def lr_decay_function(boosting_round: int) -> float:
+        decay_rate = 0.95
+        step_size = 100
+        return learning_rate * (decay_rate ** (boosting_round // step_size))
+
+    # 2. Instancie o callback nativo do XGBoost
+    lr_scheduler = xgb.callback.LearningRateScheduler(lr_decay_function)
+
+    # Stage 2: Treinamento Nativo usando Early Stopping do XGBoost
+    print("\n--- Treinando Classificador ---")
+    classifier = xgb.train(
+        params={**base_params, "objective": "multi:softprob", "num_class": 3, "eval_metric": "mlogloss"},
+        dtrain=dtrain_cls,
+        num_boost_round=n_estimators,
+        evals=[(dtrain_cls, "train"), (dval_cls, "val")],
+        early_stopping_rounds=early_stopping_rounds if early_stopping_rounds > 0 else None,
+        verbose_eval=n_estimators // 10,
+        callbacks=[lr_scheduler]
     )
 
-    val_pred_cls = _predict_classifier(classifier, x_val)
-    val_pred_home = _predict_regressor(regressor_home, x_val)
-    val_pred_away = _predict_regressor(regressor_away, x_val)
+    print("\n--- Treinando Regressor (Mandante) ---")
+    regressor_home = xgb.train(
+        params={**base_params, "objective": "reg:squarederror", "eval_metric": "rmse"},
+        dtrain=dtrain_home,
+        num_boost_round=n_estimators,
+        evals=[(dtrain_home, "train"), (dval_home, "val")],
+        early_stopping_rounds=early_stopping_rounds if early_stopping_rounds > 0 else None,
+        verbose_eval=n_estimators // 10,
+        callbacks=[lr_scheduler]
+    )
 
-    test_pred_cls = _predict_classifier(classifier, x_test)
-    test_pred_home = _predict_regressor(regressor_home, x_test)
-    test_pred_away = _predict_regressor(regressor_away, x_test)
+    print("\n--- Treinando Regressor (Visitante) ---")
+    regressor_away = xgb.train(
+        params={**base_params, "objective": "reg:squarederror", "eval_metric": "rmse"},
+        dtrain=dtrain_away,
+        num_boost_round=n_estimators,
+        evals=[(dtrain_away, "train"), (dval_away, "val")],
+        early_stopping_rounds=early_stopping_rounds if early_stopping_rounds > 0 else None,
+        verbose_eval=n_estimators // 10,
+        callbacks=[lr_scheduler]
+    )
 
-    validation_metrics = {
-        "accuracy": float(accuracy_score(y_val_cls, val_pred_cls)),
-        "mae_home": float(mean_absolute_error(y_val_home, val_pred_home)),
-        "mae_away": float(mean_absolute_error(y_val_away, val_pred_away)),
-        "rmse_home": float(np.sqrt(mean_squared_error(y_val_home, val_pred_home))),
-        "rmse_away": float(np.sqrt(mean_squared_error(y_val_away, val_pred_away))),
-    }
-    test_metrics = {
-        "accuracy": float(accuracy_score(y_test_cls, test_pred_cls)),
-        "mae_home": float(mean_absolute_error(y_test_home, test_pred_home)),
-        "mae_away": float(mean_absolute_error(y_test_away, test_pred_away)),
-        "rmse_home": float(np.sqrt(mean_squared_error(y_test_home, test_pred_home))),
-        "rmse_away": float(np.sqrt(mean_squared_error(y_test_away, test_pred_away))),
-    }
+    # Stage 3: Predições e Métricas (Validação e Teste)
+    val_pred_cls = _predict_booster(classifier, dval_cls, is_classifier=True)
+    val_pred_home = _predict_booster(regressor_home, dval_home)
+    val_pred_away = _predict_booster(regressor_away, dval_away)
 
+    test_pred_cls = _predict_booster(classifier, dtest_cls, is_classifier=True)
+    test_pred_home = _predict_booster(regressor_home, dtest_home)
+    test_pred_away = _predict_booster(regressor_away, dtest_away)
+
+    validation_metrics = _compute_metrics_from_preds(
+        y_val_cls, val_pred_cls, y_val_home, val_pred_home, y_val_away, val_pred_away
+    )
+    test_metrics = _compute_metrics_from_preds(
+        y_test_cls, test_pred_cls, y_test_home, test_pred_home, y_test_away, test_pred_away
+    )
+
+    # Coleta de melhores iterações nativas
     best_iterations = {
-        "classifier": getattr(classifier, "best_iteration", None),
-        "regressor_home": getattr(regressor_home, "best_iteration", None),
-        "regressor_away": getattr(regressor_away, "best_iteration", None),
+        "classifier": getattr(classifier, "best_iteration", n_estimators - 1),
+        "regressor_home": getattr(regressor_home, "best_iteration", n_estimators - 1),
+        "regressor_away": getattr(regressor_away, "best_iteration", n_estimators - 1),
     }
-    resolved_best_iterations = [iteration for iteration in best_iterations.values() if iteration is not None]
-    best_epoch = int(max(resolved_best_iterations) + 1) if resolved_best_iterations else n_estimators
+    
+    # Apenas para compatibilidade com o retorno anterior
+    best_epoch = int(np.max(list(best_iterations.values()))) + 1
 
-    validation_predictions = _build_validation_predictions(
-        validation_dataframe=splits.validation,
-        predicted_class_labels=val_pred_cls,
-        predicted_home_goals=val_pred_home,
-        predicted_away_goals=val_pred_away,
-    )
+    # Stage 4: Exportação de predições
+    predicted_frame = pd.concat([splits.validation, splits.test], ignore_index=True)
+    predicted_frame["pred_resultado_partida"] = np.concatenate([val_pred_cls, test_pred_cls]).astype(int)
+    predicted_frame["pred_gols_mandante"] = np.concatenate([val_pred_home, test_pred_home]).astype(float)
+    predicted_frame["pred_gols_visitante"] = np.concatenate([val_pred_away, test_pred_away]).astype(float)
 
     validation_predictions_path = Path(validation_predictions_path)
     validation_predictions_path.parent.mkdir(parents=True, exist_ok=True)
-    validation_predictions.to_csv(validation_predictions_path, index=False)
+    predicted_frame.to_csv(validation_predictions_path, index=False)
 
     result: dict[str, Any] = {
         "models": {
@@ -206,8 +213,8 @@ def train_model(
             "regressor_home": regressor_home,
             "regressor_away": regressor_away,
         },
-        "validation_metrics": validation_metrics,
-        "test_metrics": test_metrics,
+        "validation_metrics": validation_metrics.__dict__,
+        "test_metrics": test_metrics.__dict__,
         "feature_columns": [column for column in FEATURE_COLUMNS if column in dataframe.columns],
         "class_mapping": CLASS_LABEL_MAP,
         "inverse_class_mapping": INV_CLASS_LABEL_MAP,
@@ -217,28 +224,26 @@ def train_model(
         "device": "cpu",
     }
 
-    checkpoint_paths = [path for path in (save_path, best_model_path) if path is not None]
-    for checkpoint_path in checkpoint_paths:
-        checkpoint_path = Path(checkpoint_path)
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        dump(result, checkpoint_path)
+    # Stage 5: Salvar checkpoint (.joblib)
+    _save_checkpoints(result, save_path, best_model_path)
 
     return result
 
 
 def main() -> None:
     output = train_model(
+        n_estimators=20000, max_depth=4, learning_rate=5e-4, subsample=0.9,
+        colsample_bytree=0.9, reg_alpha=0.0, reg_lambda=1.0, early_stopping_rounds=50,
         save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "xgboost_checkpoint.joblib",
         best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "xgboost_best.joblib",
         validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_xgboost.csv",
     )
 
+    print("\n\n--- RESULTADOS FINAIS ---")
     print("Dispositivo:", output["device"])
-    print("Melhor época:", output["best_epoch"])
     print("Melhores iterações:", output["best_iterations"])
     print("Validação:", output["validation_metrics"])
     print("Teste:", output["test_metrics"])
-    print("Respostas de validação salvas em:", output["validation_predictions_path"])
 
 
 if __name__ == "__main__":
