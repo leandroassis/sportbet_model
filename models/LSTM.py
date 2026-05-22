@@ -80,6 +80,8 @@ class LSTMBackbone(nn.Module):
             nn.Dropout(dropout),
         )
         self.classification_head = nn.Linear(hidden_size, 3)
+        # Mantido linear sem ativação. A PoissonNLLLoss(log_input=True) calculará os gradientes
+        # de contagem de gols diretamente sob a transformação logarítmica estável.
         self.regression_head = nn.Linear(hidden_size, 2)
 
     def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -180,7 +182,9 @@ def _collect_validation_predictions(
     with torch.no_grad():
         classification_logits, regression_outputs = model(numerical_batch_tensor, categorical_batch_tensor)
         predicted_classes = classification_logits.argmax(dim=1).cpu().numpy()
-        predicted_goals = regression_outputs.cpu().numpy()
+        # Modificado: Como a rede prevê em espaço logarítmico, aplicamos a exponencial para retornar
+        # as predições para a escala real de gols ao salvar o arquivo final.
+        predicted_goals = torch.exp(regression_outputs).cpu().numpy()
 
     for row_position, predicted_class, (predicted_home_goals, predicted_away_goals) in zip(row_positions, predicted_classes, predicted_goals):
         predicted_frame.loc[row_position, "pred_resultado_partida"] = int(predicted_class)
@@ -225,7 +229,10 @@ def _compute_epoch_metrics(
             predictions = classification_logits.argmax(dim=1)
             total_correct += int((predictions == class_targets).sum().item())
 
-            prediction_error = regression_outputs - regression_targets
+            # Modificado: Para calcular métricas reais (MAE/RMSE) de gols decimais comparados com inteiros,
+            # aplicamos o mapeamento exponencial nas predições saídas do espaço logarítmico da rede.
+            real_scale_predictions = torch.exp(regression_outputs)
+            prediction_error = real_scale_predictions - regression_targets
             total_abs_error += float(prediction_error.abs().sum().item())
             total_squared_error += float((prediction_error ** 2).sum().item())
 
@@ -277,10 +284,13 @@ def train_model(
         dropout=dropout,
     ).to(runtime_device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     criterion_classification = nn.CrossEntropyLoss()
-    criterion_regression = nn.MSELoss()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.8)
+    # Modificado: Especificado explicitamente log_input=True. Isso faz o PyTorch aceitar as
+    # saídas lineares sem ativação e aplicar a transformação exponencial estável internamente na perda.
+    criterion_regression = nn.PoissonNLLLoss(log_input=True)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=5e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.7)
     use_amp = runtime_device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -375,8 +385,8 @@ def train_model(
             }
         )
 
-        if validation_metrics.loss < best_validation_loss:
-            best_validation_loss = validation_metrics.loss
+        if validation_metrics.accuracy > best_validation_loss:
+            best_validation_loss = validation_metrics.accuracy
             best_state_dict = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
             best_epoch = epoch
             best_validation_metrics = validation_metrics
@@ -405,7 +415,8 @@ def train_model(
             break
 
     if checkpoint_path is not None and checkpoint_path.exists():
-        best_checkpoint = torch.load(checkpoint_path, map_location=runtime_device)
+        with torch.serialization.safe_globals([EmbeddingSettings]):
+            best_checkpoint = torch.load(checkpoint_path, map_location=runtime_device, weights_only=False)
         model.load_state_dict(best_checkpoint["model_state_dict"])
     elif best_state_dict is not None:
         model.load_state_dict(best_state_dict)
@@ -447,7 +458,8 @@ def train_model(
     }
 
     if checkpoint_path is not None and checkpoint_path.exists():
-        checkpoint = torch.load(checkpoint_path, map_location=runtime_device)
+        with torch.serialization.safe_globals([EmbeddingSettings]):
+            checkpoint = torch.load(checkpoint_path, map_location=runtime_device, weights_only=False)
         checkpoint.update(
             {
                 "history": history,
@@ -463,12 +475,12 @@ def train_model(
 
 
 def main() -> None:
-    output = train_model(epochs=1000, sequence_length=2, batch_size=64, hidden_size=128,
-                         num_layers=2, dropout=0.4, learning_rate=1e-3, regression_weight=0.2,
+    output = train_model(epochs=10000, sequence_length=4, batch_size=128, hidden_size=32,
+                         num_layers=2, dropout=0.1, learning_rate=5e-3, regression_weight=0.2,
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=100)
+                         early_stopping_patience=500)
 
 
     print("Dispositivo:", output["device"])

@@ -97,7 +97,7 @@ def _train_embedding_model(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.AdamW(embedding_net.parameters(), lr=1e-2)
     criterion_cls = nn.CrossEntropyLoss()
-    criterion_reg = nn.MSELoss()
+    criterion_reg = nn.PoissonNLLLoss()
 
     print("\n--- Pre-training Embeddings ---")
     for epoch in range(1, epochs + 1):
@@ -233,7 +233,8 @@ def train_model(
         "alpha": reg_alpha,
         "lambda": reg_lambda,
         "seed": random_state,
-        "tree_method": "hist",
+        "tree_method": "auto",
+        "device": "cuda",
     }
 
     # 1. Defina a função de decaimento (ex: decaimento de 5% a cada 100 rodadas)
@@ -346,7 +347,7 @@ def main() -> None:
     output = train_model(
         n_estimators=20000, max_depth=4, learning_rate=5e-4, subsample=0.9,
         colsample_bytree=0.9, reg_alpha=0.0, reg_lambda=1.0, early_stopping_rounds=50,
-        embedding_epochs=50,
+        embedding_epochs=500,
         save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "xgboost_checkpoint.joblib",
         best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "xgboost_best.joblib",
         validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_xgboost.csv",

@@ -89,7 +89,9 @@ class MatchSequenceDataset(Dataset):
         self.regression_targets: list[torch.Tensor] = []
 
         # Combine the dataframes for sorting, keeping the original index
-        combined_df = numerical_dataframe.join(categorical_dataframe)
+        num_df_reset = numerical_dataframe.reset_index(drop=True)
+        cat_df_reset = categorical_dataframe[categorical_feature_columns].reset_index(drop=True)
+        combined_df = pd.concat([num_df_reset, cat_df_reset], axis=1)
         ordered = combined_df.sort_values([YEAR_COLUMN, "data", "rodada"])
 
         for _, season_frame in ordered.groupby(YEAR_COLUMN, sort=True):
@@ -191,7 +193,10 @@ def build_sequence_bundle(
 
     # 2. Calculate cardinalities from the separated categorical features dataframe
     cardinalities = {col: int(categorical_features_df[col].max() + 1) for col in categorical_feature_columns}
-    embedding_dimensions = {col: min(50, (cardinalities[col] + 1) // 2) for col in categorical_feature_columns}
+    embedding_dimensions = {
+        col: (cardinalities[col], min(50, (cardinalities[col] + 1) // 2))
+        for col in categorical_feature_columns
+    }
     embedding_settings = EmbeddingSettings(cardinalities=cardinalities, dimensions=embedding_dimensions)
 
     # 3. Define numerical features
@@ -201,8 +206,8 @@ def build_sequence_bundle(
     
     # 4. The main dataframe for splitting should contain numerical features, targets, and sorting keys
     main_df_cols = numerical_feature_columns + list(TARGET_COLUMNS) + [YEAR_COLUMN, "data", "rodada"]
-    # Ensure all columns exist in the dataframe before selecting
-    main_df_cols = [col for col in main_df_cols if col in dataframe.columns]
+    # Remove duplicates and ensure all columns exist in the dataframe
+    main_df_cols = list(dict.fromkeys([col for col in main_df_cols if col in dataframe.columns]))
     main_df = dataframe[main_df_cols].copy()
 
     # 5. Perform the temporal split on the main (mostly numerical) data
@@ -226,7 +231,7 @@ def build_sequence_bundle(
 
     # Calculate the final input size for the models
     numerical_input_size = len(numerical_feature_columns)
-    embedding_input_size = sum(embedding_dimensions.values())
+    embedding_input_size = sum(dim for _, dim in embedding_dimensions.values())
     input_size = numerical_input_size + embedding_input_size
 
     return SequenceBundle(
