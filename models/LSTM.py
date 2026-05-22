@@ -59,6 +59,8 @@ class LSTMBackbone(nn.Module):
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
+        
+        # 1. Dicionário de camadas de Embedding para as variáveis categóricas
         self.embedding_layers = nn.ModuleDict(
             {
                 name: nn.Embedding(num_embeddings, dim)
@@ -66,7 +68,13 @@ class LSTMBackbone(nn.Module):
             }
         )
         
+        # Tamanho total após juntar dados numéricos + dimensões de todos os embeddings
         lstm_input_size = numerical_input_size + sum(dim for _, dim in embedding_settings.dimensions.values())
+        
+        # 2. Normalização de Entrada para alinhar a escala numérica com os espaços vetoriais
+        self.input_bn = nn.BatchNorm1d(lstm_input_size)
+        
+        # 3. Núcleo Recorrente (LSTM)
         self.lstm = nn.LSTM(
             input_size=lstm_input_size,
             hidden_size=hidden_size,
@@ -74,32 +82,77 @@ class LSTMBackbone(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+        
+        # 4. Cabeça de Processamento Latente Profunda (MLP Head com Conexão Residual)
+        self.latent_dense1 = nn.Linear(hidden_size, hidden_size)
+        self.latent_bn1 = nn.BatchNorm1d(hidden_size)
+        self.latent_act1 = nn.ReLU()
+        self.latent_drop1 = nn.Dropout(dropout)
+        
+        self.latent_dense2 = nn.Linear(hidden_size, hidden_size)
+        self.latent_bn2 = nn.BatchNorm1d(hidden_size)
+        self.latent_act2 = nn.ReLU()
+        self.latent_drop2 = nn.Dropout(dropout)
+
+        # 5. Cabeça de Especialização: Classificação (Vitória, Empate, Derrota)
+        self.cls_block = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_size // 2, 3)
         )
-        self.classification_head = nn.Linear(hidden_size, 3)
-        # Mantido linear sem ativação. A PoissonNLLLoss(log_input=True) calculará os gradientes
-        # de contagem de gols diretamente sob a transformação logarítmica estável.
-        self.regression_head = nn.Linear(hidden_size, 2)
+        
+        # 6. Cabeça de Especialização: Regressão (Gols Mandante, Gols Visitante)
+        self.reg_block = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_size // 2, 2)
+        )
 
     def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Formatos esperados: 
+        # numerical_inputs -> [Batch, TimeSteps, Features]
+        # categorical_inputs -> [Batch, TimeSteps, CategoricalFeatures]
+        batch_size, seq_len, _ = numerical_inputs.size()
         
+        # Extrai e agrupa os embeddings para cada passo do tempo
         embeddings = [
             self.embedding_layers[name](categorical_inputs[..., i])
             for i, name in enumerate(self.embedding_layers)
         ]
         
+        # Concatena tudo no último eixo (repare que mantemos a estrutura tridimensional para a LSTM)
         combined_input = torch.cat([numerical_inputs] + embeddings, dim=-1)
         
+        # Aplica a normalização remodelando temporariamente para 2D e voltando para 3D
+        combined_input = combined_input.view(-1, combined_input.size(-1))
+        combined_input = self.input_bn(combined_input)
+        combined_input = combined_input.view(batch_size, seq_len, -1)
+        
+        # Passa pela LSTM e captura apenas o último estado oculto da sequência temporal
         outputs, _ = self.lstm(combined_input)
         last_state = outputs[:, -1, :]
-        latent = self.head(last_state)
-        classification_logits = self.classification_head(latent)
-        regression_outputs = self.regression_head(latent)
+        
+        # Primeiro bloco denso do extrator de características
+        x = self.latent_dense1(last_state)
+        x = self.latent_bn1(x)
+        x = self.latent_act1(x)
+        x = self.latent_drop1(x)
+        
+        # Segundo bloco denso com conexão residual (Soma o estado da LSTM original)
+        residual = x
+        x = self.latent_dense2(x)
+        x = self.latent_bn2(x)
+        x = x + residual # Conexão Skip Residual: evita desvanecimento de gradiente em treinos longos
+        x = self.latent_act2(x)
+        x = self.latent_drop2(x)
+        
+        # Separação das tarefas nas cabeças especializadas
+        classification_logits = self.cls_block(x)
+        regression_outputs = self.reg_block(x)
+        
         return classification_logits, regression_outputs
-
 
 def get_device(device: str | None = None) -> torch.device:
     if device is not None:
