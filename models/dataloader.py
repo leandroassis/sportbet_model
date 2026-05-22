@@ -200,6 +200,9 @@ def build_sequence_bundle(
     }
     embedding_settings = EmbeddingSettings(cardinalities=cardinalities, dimensions=embedding_dimensions)
 
+    minmaxscaler = MinMaxScaler()
+    categorical_features_df[categorical_feature_columns] = minmaxscaler.fit_transform(categorical_features_df[categorical_feature_columns])
+
     # 3. Define numerical features
     numerical_feature_columns = [
         col for col in FEATURE_COLUMNS if col not in categorical_feature_columns

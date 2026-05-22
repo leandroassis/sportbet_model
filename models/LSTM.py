@@ -495,8 +495,8 @@ def train_model(
 
 
 def main() -> None:
-    output = train_model(epochs=1000, sequence_length=5, batch_size=128, hidden_size=256,
-                         num_layers=2, dropout=0.6, learning_rate=5e-3, regression_weight=0.0,
+    output = train_model(epochs=1000, sequence_length=5, batch_size=256, hidden_size=256,
+                         num_layers=3, dropout=0.6, learning_rate=5e-3, regression_weight=0.0,
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
