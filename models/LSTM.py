@@ -407,8 +407,8 @@ def train_model(
             }
         )
 
-        if validation_metrics.accuracy > best_validation_loss:
-            best_validation_loss = validation_metrics.accuracy
+        if validation_metrics.loss > best_validation_loss:
+            best_validation_loss = validation_metrics.loss
             best_state_dict = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
             best_epoch = epoch
             best_validation_metrics = validation_metrics
@@ -495,12 +495,12 @@ def train_model(
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=10, batch_size=128, hidden_size=256,
-                         num_layers=3, dropout=0.2, learning_rate=1e-3, regression_weight=0.0,
+    output = train_model(epochs=1000, sequence_length=5, batch_size=128, hidden_size=256,
+                         num_layers=2, dropout=0.6, learning_rate=5e-3, regression_weight=0.0,
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=500)
+                         early_stopping_patience=50)
 
 
     print("Dispositivo:", output["device"])

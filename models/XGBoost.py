@@ -124,16 +124,23 @@ def _prepare_xy(
 
 
 def _compute_metrics_from_preds(
-    y_true_cls: np.ndarray, y_pred_cls: np.ndarray,
     y_true_home: np.ndarray, y_pred_home: np.ndarray,
     y_true_away: np.ndarray, y_pred_away: np.ndarray,
+    threshold: float = 0.5,
 ) -> ModelMetrics:
-    # Substituindo sklearn por numpy puro para remover dependências externas externas
-    acc = float(np.mean(y_true_cls == y_pred_cls))
-    mae_h = float(np.mean(np.abs(y_true_home - y_pred_home)))
-    mae_a = float(np.mean(np.abs(y_true_away - y_pred_away)))
-    rmse_h = float(np.sqrt(np.mean((y_true_home - y_pred_home) ** 2)))
-    rmse_a = float(np.sqrt(np.mean((y_true_away - y_pred_away) ** 2)))
+    gol_diff_pred = y_pred_home - y_pred_away
+    gol_diff_true = y_true_home - y_true_away
+
+    pred_cls = ((np.abs(gol_diff_pred) > threshold).astype(int) *
+                (2 * (gol_diff_pred > 0).astype(int) - 1) + 1)
+    true_cls = ((np.abs(gol_diff_true) > 0.5).astype(int) *
+                (2 * (gol_diff_true > 0).astype(int) - 1) + 1)
+
+    acc = float(np.mean(pred_cls == true_cls))
+    mae_h = float(np.mean(np.abs(y_pred_home - y_true_home)))
+    mae_a = float(np.mean(np.abs(y_pred_away - y_true_away)))
+    rmse_h = float(np.sqrt(np.mean((y_pred_home - y_true_home) ** 2)))
+    rmse_a = float(np.sqrt(np.mean((y_pred_away - y_true_away) ** 2)))
     return ModelMetrics(accuracy=acc, mae_home=mae_h, mae_away=mae_a, rmse_home=rmse_h, rmse_away=rmse_a)
 
 
@@ -212,15 +219,12 @@ def train_model(
     x_test = np.concatenate([x_test_num, test_embeds], axis=1)
 
     # Montando as DMatrices estruturadas
-    dtrain_cls = xgb.DMatrix(x_train, label=y_train_cls)
     dtrain_home = xgb.DMatrix(x_train, label=y_train_home)
     dtrain_away = xgb.DMatrix(x_train, label=y_train_away)
-    
-    dval_cls = xgb.DMatrix(x_val, label=y_val_cls)
+
     dval_home = xgb.DMatrix(x_val, label=y_val_home)
     dval_away = xgb.DMatrix(x_val, label=y_val_away)
-    
-    dtest_cls = xgb.DMatrix(x_test)
+
     dtest_home = xgb.DMatrix(x_test)
     dtest_away = xgb.DMatrix(x_test)
 
@@ -247,17 +251,6 @@ def train_model(
     lr_scheduler = xgb.callback.LearningRateScheduler(lr_decay_function)
 
     # Stage 2: Treinamento Nativo usando Early Stopping do XGBoost
-    print("\n--- Treinando Classificador ---")
-    classifier = xgb.train(
-        params={**base_params, "objective": "multi:softprob", "num_class": 3, "eval_metric": "mlogloss"},
-        dtrain=dtrain_cls,
-        num_boost_round=n_estimators,
-        evals=[(dtrain_cls, "train"), (dval_cls, "val")],
-        early_stopping_rounds=early_stopping_rounds if early_stopping_rounds > 0 else None,
-        verbose_eval=n_estimators // 10,
-        callbacks=[lr_scheduler]
-    )
-
     print("\n--- Treinando Regressor (Mandante) ---")
     regressor_home = xgb.train(
         params={**base_params, "objective": "reg:squarederror", "eval_metric": "rmse"},
@@ -281,32 +274,39 @@ def train_model(
     )
 
     # Stage 3: Predições e Métricas (Validação e Teste)
-    val_pred_cls = _predict_booster(classifier, dval_cls, is_classifier=True)
     val_pred_home = _predict_booster(regressor_home, dval_home)
     val_pred_away = _predict_booster(regressor_away, dval_away)
 
-    test_pred_cls = _predict_booster(classifier, dtest_cls, is_classifier=True)
     test_pred_home = _predict_booster(regressor_home, dtest_home)
     test_pred_away = _predict_booster(regressor_away, dtest_away)
 
     validation_metrics = _compute_metrics_from_preds(
-        y_val_cls, val_pred_cls, y_val_home, val_pred_home, y_val_away, val_pred_away
+        y_val_home, val_pred_home, y_val_away, val_pred_away
     )
     test_metrics = _compute_metrics_from_preds(
-        y_test_cls, test_pred_cls, y_test_home, test_pred_home, y_test_away, test_pred_away
+        y_test_home, test_pred_home, y_test_away, test_pred_away
     )
 
     # Coleta de melhores iterações nativas
     best_iterations = {
-        "classifier": getattr(classifier, "best_iteration", n_estimators - 1),
         "regressor_home": getattr(regressor_home, "best_iteration", n_estimators - 1),
         "regressor_away": getattr(regressor_away, "best_iteration", n_estimators - 1),
     }
-    
+
     # Apenas para compatibilidade com o retorno anterior
     best_epoch = int(np.max(list(best_iterations.values()))) + 1
 
-    # Stage 4: Exportação de predições
+    # Stage 4: Calcular classificações post-hoc com base no threshold
+    threshold = 0.5
+    val_gol_diff = val_pred_home - val_pred_away
+    test_gol_diff = test_pred_home - test_pred_away
+
+    val_pred_cls = ((np.abs(val_gol_diff) > threshold).astype(int) *
+                    (2 * (val_gol_diff > 0).astype(int) - 1) + 1)
+    test_pred_cls = ((np.abs(test_gol_diff) > threshold).astype(int) *
+                     (2 * (test_gol_diff > 0).astype(int) - 1) + 1)
+
+    # Stage 5: Exportação de predições
     predicted_frame = pd.concat([splits.validation, splits.test], ignore_index=True)
     predicted_frame["pred_resultado_partida"] = np.concatenate([val_pred_cls, test_pred_cls]).astype(int)
     predicted_frame["pred_gols_mandante"] = np.concatenate([val_pred_home, test_pred_home]).astype(float)
@@ -318,7 +318,6 @@ def train_model(
 
     result: dict[str, Any] = {
         "models": {
-            "classifier": classifier,
             "regressor_home": regressor_home,
             "regressor_away": regressor_away,
         },
@@ -334,6 +333,7 @@ def train_model(
         "best_iterations": best_iterations,
         "best_epoch": best_epoch,
         "validation_predictions_path": str(validation_predictions_path),
+        "threshold": threshold,
         "device": "cpu",
     }
 
