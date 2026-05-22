@@ -114,11 +114,10 @@ class MatchSequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.sequences)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
             self.sequences[index],
             self.categorical_sequences[index],
-            self.class_targets[index],
             self.regression_targets[index],
         )
 

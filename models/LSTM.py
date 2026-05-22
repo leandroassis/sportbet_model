@@ -91,54 +91,42 @@ class LSTMBackbone(nn.Module):
         self.latent_act2 = nn.ReLU()
         self.latent_drop2 = nn.Dropout(dropout)
 
-        self.cls_block = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout * 0.5),
-            nn.Linear(hidden_size // 2, 3)
-        )
-        
         self.reg_block = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout * 0.5),
             nn.Linear(hidden_size // 2, 2)
         )
+        self.threshold = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = numerical_inputs.size()
-        
+
         embeddings = [
             self.embedding_layers[name](categorical_inputs[..., i])
             for i, name in enumerate(self.embedding_layers)
         ]
-        
+
         combined_input = torch.cat([numerical_inputs] + embeddings, dim=-1)
-        
-        # Modificado: LayerNorm processa dados 3D direto, sem precisar achatar para 2D!
         combined_input = self.input_ln(combined_input)
-        
+
         outputs, _ = self.lstm(combined_input)
         last_state = outputs[:, -1, :]
-        
-        # Primeiro bloco com LayerNorm
+
         x = self.latent_dense1(last_state)
         x = self.latent_ln1(x)
         x = self.latent_act1(x)
         x = self.latent_drop1(x)
-        
-        # Segundo bloco com conexão residual e LayerNorm
+
         residual = x
         x = self.latent_dense2(x)
         x = self.latent_ln2(x)
         x = x + residual
         x = self.latent_act2(x)
         x = self.latent_drop2(x)
-        
-        classification_logits = self.cls_block(x)
+
         regression_outputs = self.reg_block(x)
-        
-        return classification_logits, regression_outputs
+        return regression_outputs
 
 def get_device(device: str | None = None) -> torch.device:
     if device is not None:
@@ -146,12 +134,11 @@ def get_device(device: str | None = None) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _move_batch(batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], device: torch.device):
-    sequences, categorical_sequences, class_targets, regression_targets = batch
+def _move_batch(batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor], device: torch.device):
+    sequences, categorical_sequences, regression_targets = batch
     return (
         sequences.to(device, non_blocking=True),
         categorical_sequences.to(device, non_blocking=True),
-        class_targets.to(device, non_blocking=True),
         regression_targets.to(device, non_blocking=True),
     )
 
@@ -219,10 +206,11 @@ def _collect_validation_predictions(
     numerical_batch_tensor = torch.stack(numerical_batches).to(device)
     categorical_batch_tensor = torch.stack(categorical_batches).to(device)
     with torch.no_grad():
-        classification_logits, regression_outputs = model(numerical_batch_tensor, categorical_batch_tensor)
-        predicted_classes = classification_logits.argmax(dim=1).cpu().numpy()
-        # Modificado: Como a rede prevê em espaço logarítmico, aplicamos a exponencial para retornar
-        # as predições para a escala real de gols ao salvar o arquivo final.
+        regression_outputs = model(numerical_batch_tensor, categorical_batch_tensor)
+        gol_diff = regression_outputs[:, 0] - regression_outputs[:, 1]
+        predicted_classes = (
+            (gol_diff.abs() > model.threshold).long() * (2 * (gol_diff > 0).long() - 1) + 1
+        ).cpu().numpy()
         predicted_goals = torch.exp(regression_outputs).cpu().numpy()
 
     for row_position, predicted_class, (predicted_home_goals, predicted_away_goals) in zip(row_positions, predicted_classes, predicted_goals):
@@ -237,13 +225,10 @@ def _compute_epoch_metrics(
     model: nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
-    criterion_classification: nn.Module,
     criterion_regression: nn.Module,
-    regression_weight: float,
 ) -> EpochMetrics:
     model.eval()
     total_loss = 0.0
-    total_classification_loss = 0.0
     total_regression_loss = 0.0
     total_correct = 0
     total_samples = 0
@@ -252,24 +237,23 @@ def _compute_epoch_metrics(
 
     with torch.no_grad():
         for batch in loader:
-            sequences, categorical_sequences, class_targets, regression_targets = _move_batch(batch, device)
-            classification_logits, regression_outputs = model(sequences, categorical_sequences)
+            sequences, categorical_sequences, regression_targets = _move_batch(batch, device)
+            regression_outputs = model(sequences, categorical_sequences)
 
-            classification_loss = criterion_classification(classification_logits, class_targets)
             regression_loss = criterion_regression(regression_outputs, regression_targets)
-            loss = classification_loss + regression_weight * regression_loss
+            loss = regression_loss
 
             batch_size = sequences.size(0)
             total_loss += float(loss.item()) * batch_size
-            total_classification_loss += float(classification_loss.item()) * batch_size
             total_regression_loss += float(regression_loss.item()) * batch_size
             total_samples += batch_size
 
-            predictions = classification_logits.argmax(dim=1)
-            total_correct += int((predictions == class_targets).sum().item())
+            gol_diff = regression_outputs[:, 0] - regression_outputs[:, 1]
+            target_diff = regression_targets[:, 0] - regression_targets[:, 1]
+            predictions = (gol_diff.abs() > model.threshold).long() * (2 * (gol_diff > 0).long() - 1)
+            targets = (target_diff.abs() > 0.5).long() * (2 * (target_diff > 0).long() - 1)
+            total_correct += int((predictions == targets).sum().item())
 
-            # Modificado: Para calcular métricas reais (MAE/RMSE) de gols decimais comparados com inteiros,
-            # aplicamos o mapeamento exponencial nas predições saídas do espaço logarítmico da rede.
             real_scale_predictions = torch.exp(regression_outputs)
             prediction_error = real_scale_predictions - regression_targets
             total_abs_error += float(prediction_error.abs().sum().item())
@@ -281,7 +265,7 @@ def _compute_epoch_metrics(
     regression_elements = total_samples * 2
     return EpochMetrics(
         loss=total_loss / total_samples,
-        classification_loss=total_classification_loss / total_samples,
+        classification_loss=0.0,
         regression_loss=total_regression_loss / total_samples,
         accuracy=total_correct / total_samples,
         mae=total_abs_error / regression_elements,
@@ -323,7 +307,6 @@ def train_model(
         dropout=dropout,
     ).to(runtime_device)
 
-    criterion_classification = nn.CrossEntropyLoss()
     # Modificado: Especificado explicitamente log_input=True. Isso faz o PyTorch aceitar as
     # saídas lineares sem ativação e aplicar a transformação exponencial estável internamente na perda.
     criterion_regression = nn.PoissonNLLLoss(log_input=True)
@@ -347,7 +330,6 @@ def train_model(
     for epoch in range(1, epochs + 1):
         model.train()
         running_loss = 0.0
-        running_classification_loss = 0.0
         running_regression_loss = 0.0
         running_correct = 0
         running_samples = 0
@@ -355,14 +337,13 @@ def train_model(
         total_steps = len(bundle.train_loader)
 
         for step, batch in enumerate(bundle.train_loader, start=1):
-            sequences, categorical_sequences, class_targets, regression_targets = _move_batch(batch, runtime_device)
+            sequences, categorical_sequences, regression_targets = _move_batch(batch, runtime_device)
             optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=use_amp):
-                classification_logits, regression_outputs = model(sequences, categorical_sequences)
-                classification_loss = criterion_classification(classification_logits, class_targets)
+                regression_outputs = model(sequences, categorical_sequences)
                 regression_loss = criterion_regression(regression_outputs, regression_targets)
-                loss = (classification_loss + regression_loss)/(classification_loss**2 + regression_loss**2).sqrt()
+                loss = regression_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -371,9 +352,13 @@ def train_model(
             batch_size_actual = sequences.size(0)
             running_samples += batch_size_actual
             running_loss += float(loss.item()) * batch_size_actual
-            running_classification_loss += float(classification_loss.item()) * batch_size_actual
             running_regression_loss += float(regression_loss.item()) * batch_size_actual
-            running_correct += int((classification_logits.argmax(dim=1) == class_targets).sum().item())
+
+            gol_diff = regression_outputs[:, 0] - regression_outputs[:, 1]
+            target_diff = regression_targets[:, 0] - regression_targets[:, 1]
+            predictions = (gol_diff.abs() > model.threshold).long() * (2 * (gol_diff > 0).long() - 1)
+            targets = (target_diff.abs() > 0.5).long() * (2 * (target_diff > 0).long() - 1)
+            running_correct += int((predictions == targets).sum().item())
 
             _render_progress(
                 epoch=epoch,
@@ -390,7 +375,7 @@ def train_model(
 
         train_metrics = EpochMetrics(
             loss=running_loss / running_samples if running_samples else 0.0,
-            classification_loss=running_classification_loss / running_samples if running_samples else 0.0,
+            classification_loss=0.0,
             regression_loss=running_regression_loss / running_samples if running_samples else 0.0,
             accuracy=running_correct / running_samples if running_samples else 0.0,
             mae=0.0,
@@ -401,9 +386,7 @@ def train_model(
             model=model,
             loader=bundle.validation_loader,
             device=runtime_device,
-            criterion_classification=criterion_classification,
             criterion_regression=criterion_regression,
-            regression_weight=regression_weight,
         )
 
         summary_line = (
@@ -480,9 +463,7 @@ def train_model(
         model=model,
         loader=bundle.test_loader,
         device=runtime_device,
-        criterion_classification=criterion_classification,
         criterion_regression=criterion_regression,
-        regression_weight=regression_weight,
     )
 
     result: dict[str, Any] = {
