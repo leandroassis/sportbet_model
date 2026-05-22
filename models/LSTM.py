@@ -59,6 +59,7 @@ class LSTMBackbone(nn.Module):
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
+        
         self.embedding_layers = nn.ModuleDict(
             {
                 name: nn.Embedding(num_embeddings, dim)
@@ -67,6 +68,10 @@ class LSTMBackbone(nn.Module):
         )
         
         lstm_input_size = numerical_input_size + sum(dim for _, dim in embedding_settings.dimensions.values())
+        
+        # Modificado: Mudamos para LayerNorm. Ela não liga se o tamanho do batch for 1.
+        self.input_ln = nn.LayerNorm(lstm_input_size)
+        
         self.lstm = nn.LSTM(
             input_size=lstm_input_size,
             hidden_size=hidden_size,
@@ -74,17 +79,34 @@ class LSTMBackbone(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+        
+        # Modificado: Mudamos os blocos internos também para LayerNorm
+        self.latent_dense1 = nn.Linear(hidden_size, hidden_size)
+        self.latent_ln1 = nn.LayerNorm(hidden_size)
+        self.latent_act1 = nn.ReLU()
+        self.latent_drop1 = nn.Dropout(dropout)
+        
+        self.latent_dense2 = nn.Linear(hidden_size, hidden_size)
+        self.latent_ln2 = nn.LayerNorm(hidden_size)
+        self.latent_act2 = nn.ReLU()
+        self.latent_drop2 = nn.Dropout(dropout)
+
+        self.cls_block = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_size // 2, 3)
         )
-        self.classification_head = nn.Linear(hidden_size, 3)
-        # Mantido linear sem ativação. A PoissonNLLLoss(log_input=True) calculará os gradientes
-        # de contagem de gols diretamente sob a transformação logarítmica estável.
-        self.regression_head = nn.Linear(hidden_size, 2)
+        
+        self.reg_block = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(hidden_size // 2, 2)
+        )
 
     def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = numerical_inputs.size()
         
         embeddings = [
             self.embedding_layers[name](categorical_inputs[..., i])
@@ -93,13 +115,30 @@ class LSTMBackbone(nn.Module):
         
         combined_input = torch.cat([numerical_inputs] + embeddings, dim=-1)
         
+        # Modificado: LayerNorm processa dados 3D direto, sem precisar achatar para 2D!
+        combined_input = self.input_ln(combined_input)
+        
         outputs, _ = self.lstm(combined_input)
         last_state = outputs[:, -1, :]
-        latent = self.head(last_state)
-        classification_logits = self.classification_head(latent)
-        regression_outputs = self.regression_head(latent)
+        
+        # Primeiro bloco com LayerNorm
+        x = self.latent_dense1(last_state)
+        x = self.latent_ln1(x)
+        x = self.latent_act1(x)
+        x = self.latent_drop1(x)
+        
+        # Segundo bloco com conexão residual e LayerNorm
+        residual = x
+        x = self.latent_dense2(x)
+        x = self.latent_ln2(x)
+        x = x + residual
+        x = self.latent_act2(x)
+        x = self.latent_drop2(x)
+        
+        classification_logits = self.cls_block(x)
+        regression_outputs = self.reg_block(x)
+        
         return classification_logits, regression_outputs
-
 
 def get_device(device: str | None = None) -> torch.device:
     if device is not None:
@@ -323,7 +362,7 @@ def train_model(
                 classification_logits, regression_outputs = model(sequences, categorical_sequences)
                 classification_loss = criterion_classification(classification_logits, class_targets)
                 regression_loss = criterion_regression(regression_outputs, regression_targets)
-                loss = classification_loss + regression_weight * regression_loss
+                loss = (classification_loss + regression_loss)/(classification_loss**2 + regression_loss**2).sqrt()
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -475,8 +514,8 @@ def train_model(
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=4, batch_size=128, hidden_size=32,
-                         num_layers=2, dropout=0.1, learning_rate=5e-3, regression_weight=0.2,
+    output = train_model(epochs=10000, sequence_length=10, batch_size=128, hidden_size=256,
+                         num_layers=3, dropout=0.2, learning_rate=1e-3, regression_weight=0.0,
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
