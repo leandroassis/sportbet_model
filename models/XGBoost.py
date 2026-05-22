@@ -10,10 +10,26 @@ import pandas as pd
 from joblib import dump
 import xgboost as xgb  # type: ignore[import-not-found]
 
+import torch
+from torch import nn
+from torch.utils.data import TensorDataset, DataLoader
+
 try:
-    from .dataloader import CLASS_LABEL_MAP, FEATURE_COLUMNS, load_match_dataframe, split_match_dataframe
+    from .dataloader import (
+        CLASS_LABEL_MAP,
+        FEATURE_COLUMNS,
+        load_match_dataframe,
+        split_match_dataframe,
+        EmbeddingSettings,
+    )
 except ImportError:  # pragma: no cover
-    from dataloader import CLASS_LABEL_MAP, FEATURE_COLUMNS, load_match_dataframe, split_match_dataframe
+    from dataloader import (
+        CLASS_LABEL_MAP,
+        FEATURE_COLUMNS,
+        load_match_dataframe,
+        split_match_dataframe,
+        EmbeddingSettings,
+    )
 
 
 YEAR_COLUMN = "ano_campeonato"
@@ -37,13 +53,74 @@ class ModelMetrics:
     rmse_away: float
 
 
-def _prepare_xy(dataframe: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    feature_columns = [column for column in FEATURE_COLUMNS if column in dataframe.columns]
-    x_values = dataframe[feature_columns].to_numpy(dtype=np.float32)
+class EmbeddingNet(nn.Module):
+    def __init__(self, embedding_settings: EmbeddingSettings):
+        super().__init__()
+        self.embeddings = nn.ModuleDict(
+            {
+                name: nn.Embedding(cardinality, dim)
+                for name, (cardinality, dim) in embedding_settings.dimensions.items()
+            }
+        )
+        total_embedding_dim = sum(dim for _, dim in embedding_settings.dimensions.values())
+        self.classifier = nn.Linear(total_embedding_dim, 3)
+        self.regressor = nn.Linear(total_embedding_dim, 2)
+
+    def forward(self, x_cat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        cat_embeds = [self.embeddings[name](x_cat[:, i]) for i, name in enumerate(self.embeddings)]
+        cat_embeds = torch.cat(cat_embeds, dim=1)
+        
+        class_out = self.classifier(cat_embeds)
+        reg_out = self.regressor(cat_embeds)
+        return class_out, reg_out
+
+    def get_embeddings(self, x_cat: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            cat_embeds = [self.embeddings[name](x_cat[:, i]) for i, name in enumerate(self.embeddings)]
+            return torch.cat(cat_embeds, dim=1)
+
+
+def _train_embedding_model(
+    embedding_net: EmbeddingNet,
+    x_cat: np.ndarray,
+    y_cls: np.ndarray,
+    y_home: np.ndarray,
+    y_away: np.ndarray,
+    epochs: int = 5,
+    batch_size: int = 256,
+) -> None:
+    dataset = TensorDataset(
+        torch.from_numpy(x_cat).long(),
+        torch.from_numpy(y_cls).long(),
+        torch.from_numpy(np.stack([y_home, y_away], axis=1)).float(),
+    )
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    optimizer = torch.optim.AdamW(embedding_net.parameters(), lr=1e-2)
+    criterion_cls = nn.CrossEntropyLoss()
+    criterion_reg = nn.MSELoss()
+
+    print("\n--- Pre-training Embeddings ---")
+    for epoch in range(1, epochs + 1):
+        for x_batch, y_cls_batch, y_reg_batch in loader:
+            optimizer.zero_grad()
+            cls_out, reg_out = embedding_net(x_batch)
+            loss = criterion_cls(cls_out, y_cls_batch) + 0.5 * criterion_reg(reg_out, y_reg_batch)
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch}/{epochs}, Loss: {loss.item():.4f}")
+
+
+def _prepare_xy(
+    dataframe: pd.DataFrame,
+    numerical_cols: list[str],
+    categorical_cols: list[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    x_num = dataframe[numerical_cols].to_numpy(dtype=np.float32)
+    x_cat = dataframe[categorical_cols].to_numpy(dtype=np.int64)
     y_class = dataframe[TARGET_COLUMNS[0]].astype(int).map(CLASS_LABEL_MAP).to_numpy(dtype=np.int64)
     y_home_goals = dataframe[TARGET_COLUMNS[1]].to_numpy(dtype=np.float32)
     y_away_goals = dataframe[TARGET_COLUMNS[2]].to_numpy(dtype=np.float32)
-    return x_values, y_class, y_home_goals, y_away_goals
+    return x_num, x_cat, y_class, y_home_goals, y_away_goals
 
 
 def _compute_metrics_from_preds(
@@ -87,6 +164,7 @@ def train_model(
     reg_alpha: float = 0.0,
     reg_lambda: float = 1.0,
     early_stopping_rounds: int = 50,
+    embedding_epochs: int = 5,
     save_path: str | Path | None = None,
     best_model_path: str | Path | None = None,
     validation_predictions_path: str | Path = Path(__file__).resolve().parents[0] / "results" / "respostas_xgboost.csv",
@@ -96,12 +174,42 @@ def train_model(
     dataframe = load_match_dataframe(csv_path)
     splits = split_match_dataframe(dataframe)
 
-    x_train, y_train_cls, y_train_home, y_train_away = _prepare_xy(splits.train)
-    x_val, y_val_cls, y_val_home, y_val_away = _prepare_xy(splits.validation)
-    x_test, y_test_cls, y_test_home, y_test_away = _prepare_xy(splits.test)
+    categorical_feature_columns = [
+        col for col in [
+            "arbitro", "estadio", "tecnico_mandante", "tecnico_visitante", "time_mandante", "time_visitante"
+        ] if col in dataframe.columns
+    ]
+    numerical_feature_columns = [
+        col for col in FEATURE_COLUMNS if col not in categorical_feature_columns and col in dataframe.columns
+    ]
 
-    if len(x_val) == 0:
+    cardinalities = {col: int(dataframe[col].max() + 1) for col in categorical_feature_columns}
+    embedding_dimensions = {
+        col: (cardinalities[col], min(50, (cardinalities[col] + 1) // 2))
+        for col in categorical_feature_columns
+    }
+    embedding_settings = EmbeddingSettings(cardinalities=cardinalities, dimensions=embedding_dimensions)
+
+    x_train_num, x_train_cat, y_train_cls, y_train_home, y_train_away = _prepare_xy(splits.train, numerical_feature_columns, categorical_feature_columns)
+    x_val_num, x_val_cat, y_val_cls, y_val_home, y_val_away = _prepare_xy(splits.validation, numerical_feature_columns, categorical_feature_columns)
+    x_test_num, x_test_cat, y_test_cls, y_test_home, y_test_away = _prepare_xy(splits.test, numerical_feature_columns, categorical_feature_columns)
+
+    if len(x_val_num) == 0:
         raise ValueError("validation split is empty; check the year reconstruction logic before training")
+
+    # Pre-train embeddings
+    embedding_net = EmbeddingNet(embedding_settings)
+    _train_embedding_model(embedding_net, x_train_cat, y_train_cls, y_train_home, y_train_away, epochs=embedding_epochs)
+
+    # Get embedding features
+    train_embeds = embedding_net.get_embeddings(torch.from_numpy(x_train_cat).long()).numpy()
+    val_embeds = embedding_net.get_embeddings(torch.from_numpy(x_val_cat).long()).numpy()
+    test_embeds = embedding_net.get_embeddings(torch.from_numpy(x_test_cat).long()).numpy()
+
+    # Combine numerical and embedding features
+    x_train = np.concatenate([x_train_num, train_embeds], axis=1)
+    x_val = np.concatenate([x_val_num, val_embeds], axis=1)
+    x_test = np.concatenate([x_test_num, test_embeds], axis=1)
 
     # Montando as DMatrices estruturadas
     dtrain_cls = xgb.DMatrix(x_train, label=y_train_cls)
@@ -213,9 +321,13 @@ def train_model(
             "regressor_home": regressor_home,
             "regressor_away": regressor_away,
         },
+        "embedding_net_state_dict": embedding_net.state_dict(),
+        "embedding_settings": embedding_settings,
+        "numerical_feature_columns": numerical_feature_columns,
+        "categorical_feature_columns": categorical_feature_columns,
         "validation_metrics": validation_metrics.__dict__,
         "test_metrics": test_metrics.__dict__,
-        "feature_columns": [column for column in FEATURE_COLUMNS if column in dataframe.columns],
+        "feature_columns": numerical_feature_columns + list(embedding_settings.dimensions.keys()),
         "class_mapping": CLASS_LABEL_MAP,
         "inverse_class_mapping": INV_CLASS_LABEL_MAP,
         "best_iterations": best_iterations,
@@ -234,6 +346,7 @@ def main() -> None:
     output = train_model(
         n_estimators=20000, max_depth=4, learning_rate=5e-4, subsample=0.9,
         colsample_bytree=0.9, reg_alpha=0.0, reg_lambda=1.0, early_stopping_rounds=50,
+        embedding_epochs=50,
         save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "xgboost_checkpoint.joblib",
         best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "xgboost_best.joblib",
         validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_xgboost.csv",

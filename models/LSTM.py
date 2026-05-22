@@ -16,9 +16,27 @@ import pandas as pd
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.cuda.amp.*")
 
 try:
-    from .dataloader import SequenceBundle, build_sequence_bundle, load_match_dataframe, split_match_dataframe, FEATURE_COLUMNS, YEAR_COLUMN, CLASS_LABEL_MAP
+    from .dataloader import (
+        CLASS_LABEL_MAP,
+        FEATURE_COLUMNS,
+        YEAR_COLUMN,
+        EmbeddingSettings,
+        SequenceBundle,
+        build_sequence_bundle,
+        load_match_dataframe,
+        split_match_dataframe,
+    )
 except ImportError:  # pragma: no cover - fallback when run as a standalone script
-    from dataloader import SequenceBundle, build_sequence_bundle, load_match_dataframe, split_match_dataframe, FEATURE_COLUMNS, YEAR_COLUMN, CLASS_LABEL_MAP
+    from dataloader import (
+        CLASS_LABEL_MAP,
+        FEATURE_COLUMNS,
+        YEAR_COLUMN,
+        EmbeddingSettings,
+        SequenceBundle,
+        build_sequence_bundle,
+        load_match_dataframe,
+        split_match_dataframe,
+    )
 
 
 @dataclass
@@ -32,10 +50,25 @@ class EpochMetrics:
 
 
 class LSTMBackbone(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int = 128, num_layers: int = 2, dropout: float = 0.2) -> None:
+    def __init__(
+        self,
+        numerical_input_size: int,
+        embedding_settings: EmbeddingSettings,
+        hidden_size: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
         super().__init__()
+        self.embedding_layers = nn.ModuleDict(
+            {
+                name: nn.Embedding(num_embeddings, dim)
+                for name, (num_embeddings, dim) in embedding_settings.dimensions.items()
+            }
+        )
+        
+        lstm_input_size = numerical_input_size + sum(dim for _, dim in embedding_settings.dimensions.values())
         self.lstm = nn.LSTM(
-            input_size=input_size,
+            input_size=lstm_input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
@@ -49,8 +82,16 @@ class LSTMBackbone(nn.Module):
         self.classification_head = nn.Linear(hidden_size, 3)
         self.regression_head = nn.Linear(hidden_size, 2)
 
-    def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        outputs, _ = self.lstm(inputs)
+    def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        
+        embeddings = [
+            self.embedding_layers[name](categorical_inputs[..., i])
+            for i, name in enumerate(self.embedding_layers)
+        ]
+        
+        combined_input = torch.cat([numerical_inputs] + embeddings, dim=-1)
+        
+        outputs, _ = self.lstm(combined_input)
         last_state = outputs[:, -1, :]
         latent = self.head(last_state)
         classification_logits = self.classification_head(latent)
@@ -64,10 +105,11 @@ def get_device(device: str | None = None) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _move_batch(batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor], device: torch.device):
-    sequences, class_targets, regression_targets = batch
+def _move_batch(batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], device: torch.device):
+    sequences, categorical_sequences, class_targets, regression_targets = batch
     return (
         sequences.to(device, non_blocking=True),
+        categorical_sequences.to(device, non_blocking=True),
         class_targets.to(device, non_blocking=True),
         regression_targets.to(device, non_blocking=True),
     )
@@ -101,7 +143,8 @@ def _render_progress(epoch: int, epochs: int, step: int, total_steps: int, loss:
 def _collect_validation_predictions(
     model: nn.Module,
     validation_dataframe,
-    feature_columns: list[str],
+    numerical_feature_columns: list[str],
+    categorical_feature_columns: list[str],
     sequence_length: int,
     device: torch.device,
 ) -> Any:
@@ -111,7 +154,8 @@ def _collect_validation_predictions(
     predicted_frame["pred_gols_visitante"] = np.nan
 
     model.eval()
-    batches: list[torch.Tensor] = []
+    numerical_batches: list[torch.Tensor] = []
+    categorical_batches: list[torch.Tensor] = []
     row_positions: list[int] = []
 
     ordered = validation_dataframe.sort_values([YEAR_COLUMN, "data", "rodada"])
@@ -120,18 +164,21 @@ def _collect_validation_predictions(
         if len(season_frame) < sequence_length:
             continue
 
-        features = torch.tensor(season_frame[feature_columns].to_numpy(), dtype=torch.float32)
+        numerical_features = torch.tensor(season_frame[numerical_feature_columns].to_numpy(), dtype=torch.float32)
+        categorical_features = torch.tensor(season_frame[categorical_feature_columns].to_numpy(), dtype=torch.int64)
         for end_index in range(sequence_length - 1, len(season_frame)):
             start_index = end_index - sequence_length + 1
-            batches.append(features[start_index : end_index + 1])
+            numerical_batches.append(numerical_features[start_index : end_index + 1])
+            categorical_batches.append(categorical_features[start_index : end_index + 1])
             row_positions.append(int(season_frame.loc[end_index, "index"]))
 
-    if not batches:
+    if not numerical_batches:
         return predicted_frame
 
-    batch_tensor = torch.stack(batches).to(device)
+    numerical_batch_tensor = torch.stack(numerical_batches).to(device)
+    categorical_batch_tensor = torch.stack(categorical_batches).to(device)
     with torch.no_grad():
-        classification_logits, regression_outputs = model(batch_tensor)
+        classification_logits, regression_outputs = model(numerical_batch_tensor, categorical_batch_tensor)
         predicted_classes = classification_logits.argmax(dim=1).cpu().numpy()
         predicted_goals = regression_outputs.cpu().numpy()
 
@@ -162,8 +209,8 @@ def _compute_epoch_metrics(
 
     with torch.no_grad():
         for batch in loader:
-            sequences, class_targets, regression_targets = _move_batch(batch, device)
-            classification_logits, regression_outputs = model(sequences)
+            sequences, categorical_sequences, class_targets, regression_targets = _move_batch(batch, device)
+            classification_logits, regression_outputs = model(sequences, categorical_sequences)
 
             classification_loss = criterion_classification(classification_logits, class_targets)
             regression_loss = criterion_regression(regression_outputs, regression_targets)
@@ -223,7 +270,8 @@ def train_model(
     runtime_device = get_device(device)
 
     model = LSTMBackbone(
-        input_size=bundle.input_size,
+        numerical_input_size=len(bundle.numerical_feature_columns),
+        embedding_settings=bundle.embedding_settings,
         hidden_size=hidden_size,
         num_layers=num_layers,
         dropout=dropout,
@@ -232,7 +280,7 @@ def train_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     criterion_classification = nn.CrossEntropyLoss()
     criterion_regression = nn.MSELoss()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.2)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.8)
     use_amp = runtime_device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -258,11 +306,11 @@ def train_model(
         total_steps = len(bundle.train_loader)
 
         for step, batch in enumerate(bundle.train_loader, start=1):
-            sequences, class_targets, regression_targets = _move_batch(batch, runtime_device)
+            sequences, categorical_sequences, class_targets, regression_targets = _move_batch(batch, runtime_device)
             optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=use_amp):
-                classification_logits, regression_outputs = model(sequences)
+                classification_logits, regression_outputs = model(sequences, categorical_sequences)
                 classification_loss = criterion_classification(classification_logits, class_targets)
                 regression_loss = criterion_regression(regression_outputs, regression_targets)
                 loss = classification_loss + regression_weight * regression_loss
@@ -337,8 +385,9 @@ def train_model(
                 torch.save(
                     {
                         "model_state_dict": best_state_dict,
-                        "feature_columns": bundle.feature_columns,
-                        "input_size": bundle.input_size,
+                        "numerical_feature_columns": bundle.numerical_feature_columns,
+                        "categorical_feature_columns": bundle.categorical_feature_columns,
+                        "embedding_settings": bundle.embedding_settings,
                         "sequence_length": sequence_length,
                         "hidden_size": hidden_size,
                         "num_layers": num_layers,
@@ -370,7 +419,8 @@ def train_model(
     validation_predictions = _collect_validation_predictions(
         model=model,
         validation_dataframe=test_and_validation_dataframe,
-        feature_columns=bundle.feature_columns,
+        numerical_feature_columns=bundle.numerical_feature_columns,
+        categorical_feature_columns=bundle.categorical_feature_columns,
         sequence_length=sequence_length,
         device=runtime_device,
     )
@@ -413,8 +463,8 @@ def train_model(
 
 
 def main() -> None:
-    output = train_model(epochs=1000, sequence_length=5, batch_size=32, hidden_size=128,
-                         num_layers=3, dropout=0.4, learning_rate=1e-3, regression_weight=0.5,
+    output = train_model(epochs=1000, sequence_length=2, batch_size=64, hidden_size=128,
+                         num_layers=2, dropout=0.4, learning_rate=1e-3, regression_weight=0.2,
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",

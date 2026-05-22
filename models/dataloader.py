@@ -50,6 +50,12 @@ FEATURE_COLUMNS = [
 
 
 @dataclass(frozen=True)
+class EmbeddingSettings:
+    cardinalities: dict[str, int]
+    dimensions: dict[str, int]
+
+
+@dataclass(frozen=True)
 class TemporalSplit:
     train: pd.DataFrame
     test: pd.DataFrame
@@ -61,40 +67,56 @@ class SequenceBundle:
     train_loader: DataLoader
     test_loader: DataLoader
     validation_loader: DataLoader
-    feature_columns: list[str]
+    numerical_feature_columns: list[str]
+    categorical_feature_columns: list[str]
     input_size: int
+    embedding_settings: EmbeddingSettings
     class_mapping: dict[int, int]
 
 
 class MatchSequenceDataset(Dataset):
-    def __init__(self, dataframe: pd.DataFrame, feature_columns: list[str], sequence_length: int) -> None:
+    def __init__(
+        self,
+        numerical_dataframe: pd.DataFrame,
+        categorical_dataframe: pd.DataFrame,
+        numerical_feature_columns: list[str],
+        categorical_feature_columns: list[str],
+        sequence_length: int,
+    ) -> None:
         self.sequences: list[torch.Tensor] = []
+        self.categorical_sequences: list[torch.Tensor] = []
         self.class_targets: list[int] = []
         self.regression_targets: list[torch.Tensor] = []
 
-        ordered = dataframe.sort_values([YEAR_COLUMN, "data", "rodada"])
+        # Combine the dataframes for sorting, keeping the original index
+        combined_df = numerical_dataframe.join(categorical_dataframe)
+        ordered = combined_df.sort_values([YEAR_COLUMN, "data", "rodada"])
+
         for _, season_frame in ordered.groupby(YEAR_COLUMN, sort=True):
             season_frame = season_frame.sort_values(["data", "rodada"]).reset_index(drop=True)
             if len(season_frame) < sequence_length:
                 continue
 
-            features = torch.tensor(season_frame[feature_columns].to_numpy(), dtype=torch.float32)
+            numerical_features = torch.tensor(season_frame[numerical_feature_columns].to_numpy(), dtype=torch.float32)
+            categorical_features = torch.tensor(season_frame[categorical_feature_columns].to_numpy(), dtype=torch.int64)
             class_values = season_frame["resultado_partida"].astype(int).map(CLASS_LABEL_MAP).to_numpy()
             regression_values = torch.tensor(season_frame[["gols_mandante", "gols_visitante"]].to_numpy(), dtype=torch.float32)
 
             for end_index in range(sequence_length - 1, len(season_frame)):
                 start_index = end_index - sequence_length + 1
-                self.sequences.append(features[start_index : end_index + 1])
+                self.sequences.append(numerical_features[start_index : end_index + 1])
+                self.categorical_sequences.append(categorical_features[start_index : end_index + 1])
                 self.class_targets.append(int(class_values[end_index]))
                 self.regression_targets.append(regression_values[end_index])
 
     def __len__(self) -> int:
-        return len(self.class_targets)
+        return len(self.sequences)
 
-    def __getitem__(self, index: int):
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
         return (
             self.sequences[index],
-            torch.tensor(self.class_targets[index], dtype=torch.long),
+            self.categorical_sequences[index],
+            self.class_targets[index],
             self.regression_targets[index],
         )
 
@@ -126,15 +148,29 @@ def split_match_dataframe(dataframe: pd.DataFrame) -> TemporalSplit:
 
 
 def _build_loader(
-    dataframe: pd.DataFrame,
-    feature_columns: list[str],
+    numerical_df: pd.DataFrame,
+    categorical_df: pd.DataFrame,
+    numerical_feature_columns: list[str],
+    categorical_feature_columns: list[str],
     sequence_length: int,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
 ) -> DataLoader:
-    dataset = MatchSequenceDataset(dataframe=dataframe, feature_columns=feature_columns, sequence_length=sequence_length)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=torch.cuda.is_available())
+    dataset = MatchSequenceDataset(
+        numerical_dataframe=numerical_df,
+        categorical_dataframe=categorical_df,
+        numerical_feature_columns=numerical_feature_columns,
+        categorical_feature_columns=categorical_feature_columns,
+        sequence_length=sequence_length,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
 
 def build_sequence_bundle(
@@ -145,18 +181,61 @@ def build_sequence_bundle(
 ) -> SequenceBundle:
     
     dataframe = load_match_dataframe(csv_path)
-    splits = split_match_dataframe(dataframe)
-    feature_columns = [column for column in FEATURE_COLUMNS if column in dataframe.columns]
+    
+    categorical_feature_columns = [
+        "arbitro", "estadio", "tecnico_mandante", "tecnico_visitante", "time_mandante", "time_visitante"
+    ]
+    
+    # 1. Create a separate dataframe for categorical features
+    categorical_features_df = dataframe[categorical_feature_columns].copy()
 
-    train_loader = _build_loader(splits.train, feature_columns, sequence_length, batch_size, shuffle=True, num_workers=num_workers)
-    test_loader = _build_loader(splits.test, feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers)
-    validation_loader = _build_loader(splits.validation, feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers)
+    # 2. Calculate cardinalities from the separated categorical features dataframe
+    cardinalities = {col: int(categorical_features_df[col].max() + 1) for col in categorical_feature_columns}
+    embedding_dimensions = {col: min(50, (cardinalities[col] + 1) // 2) for col in categorical_feature_columns}
+    embedding_settings = EmbeddingSettings(cardinalities=cardinalities, dimensions=embedding_dimensions)
+
+    # 3. Define numerical features
+    numerical_feature_columns = [
+        col for col in FEATURE_COLUMNS if col not in categorical_feature_columns
+    ]
+    
+    # 4. The main dataframe for splitting should contain numerical features, targets, and sorting keys
+    main_df_cols = numerical_feature_columns + list(TARGET_COLUMNS) + [YEAR_COLUMN, "data", "rodada"]
+    # Ensure all columns exist in the dataframe before selecting
+    main_df_cols = [col for col in main_df_cols if col in dataframe.columns]
+    main_df = dataframe[main_df_cols].copy()
+
+    # 5. Perform the temporal split on the main (mostly numerical) data
+    splits = split_match_dataframe(main_df)
+
+    # 6. Use the indices from the splits to slice the categorical features
+    train_categorical_features = categorical_features_df.loc[splits.train.index]
+    test_categorical_features = categorical_features_df.loc[splits.test.index]
+    validation_categorical_features = categorical_features_df.loc[splits.validation.index]
+
+    # 7. Pass the correct dataframes to the loader builder
+    train_loader = _build_loader(
+        splits.train, train_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=True, num_workers=num_workers
+    )
+    test_loader = _build_loader(
+        splits.test, test_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers
+    )
+    validation_loader = _build_loader(
+        splits.validation, validation_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers
+    )
+
+    # Calculate the final input size for the models
+    numerical_input_size = len(numerical_feature_columns)
+    embedding_input_size = sum(embedding_dimensions.values())
+    input_size = numerical_input_size + embedding_input_size
 
     return SequenceBundle(
         train_loader=train_loader,
         test_loader=test_loader,
         validation_loader=validation_loader,
-        feature_columns=feature_columns,
-        input_size=len(feature_columns),
+        numerical_feature_columns=numerical_feature_columns,
+        categorical_feature_columns=categorical_feature_columns,
+        input_size=input_size,
+        embedding_settings=embedding_settings,
         class_mapping=CLASS_LABEL_MAP.copy(),
     )
