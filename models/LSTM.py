@@ -357,7 +357,7 @@ def train_model(
             gol_diff = regression_outputs[:, 0] - regression_outputs[:, 1]
             target_diff = regression_targets[:, 0] - regression_targets[:, 1]
             predictions = (gol_diff.abs() > model.threshold).long() * (2 * (gol_diff > 0).long() - 1)
-            targets = (target_diff.abs() > 0.5).long() * (2 * (target_diff > 0).long() - 1)
+            targets = (target_diff.abs() > model.threshold).long() * (2 * (target_diff > 0).long() - 1)
             running_correct += int((predictions == targets).sum().item())
 
             _render_progress(

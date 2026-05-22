@@ -188,6 +188,8 @@ def build_sequence_bundle(
     ]
     
     # 1. Create a separate dataframe for categorical features
+    categorical_feature_columns_in_df = [col for col in categorical_feature_columns if col in dataframe.columns]
+    categorical_feature_columns = categorical_feature_columns_in_df.copy()
     categorical_features_df = dataframe[categorical_feature_columns].copy()
 
     # 2. Calculate cardinalities from the separated categorical features dataframe
@@ -202,6 +204,9 @@ def build_sequence_bundle(
     numerical_feature_columns = [
         col for col in FEATURE_COLUMNS if col not in categorical_feature_columns
     ]
+
+    numerical_feature_columns_in_df = [col for col in numerical_feature_columns if col in dataframe.columns]
+    numerical_feature_columns = numerical_feature_columns_in_df.copy()
     
     # 4. The main dataframe for splitting should contain numerical features, targets, and sorting keys
     main_df_cols = numerical_feature_columns + list(TARGET_COLUMNS) + [YEAR_COLUMN, "data", "rodada"]

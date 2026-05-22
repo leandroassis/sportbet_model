@@ -104,7 +104,7 @@ def _train_embedding_model(
         for x_batch, y_cls_batch, y_reg_batch in loader:
             optimizer.zero_grad()
             cls_out, reg_out = embedding_net(x_batch)
-            loss = criterion_cls(cls_out, y_cls_batch) + 0.5 * criterion_reg(reg_out, y_reg_batch)
+            loss = criterion_reg(reg_out, y_reg_batch)
             loss.backward()
             optimizer.step()
         print(f"Epoch {epoch}/{epochs}, Loss: {loss.item():.4f}")
@@ -239,6 +239,7 @@ def train_model(
         "seed": random_state,
         "tree_method": "auto",
         "device": "cuda",
+        "grow_policy": "depthwise",
     }
 
     # 1. Defina a função de decaimento (ex: decaimento de 5% a cada 100 rodadas)
@@ -251,6 +252,10 @@ def train_model(
     lr_scheduler = xgb.callback.LearningRateScheduler(lr_decay_function)
 
     # Stage 2: Treinamento Nativo usando Early Stopping do XGBoost
+    print("\n=== GPU ACCELERATION ENABLED ===")
+    print(f"XGBoost: tree_method={base_params['tree_method']}, device={base_params['device']}")
+    print("==================================\n")
+
     print("\n--- Treinando Regressor (Mandante) ---")
     regressor_home = xgb.train(
         params={**base_params, "objective": "reg:squarederror", "eval_metric": "rmse"},
