@@ -117,7 +117,8 @@ def _prepare_xy(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     x_num = dataframe[numerical_cols].to_numpy(dtype=np.float32)
     x_cat = dataframe[categorical_cols].to_numpy(dtype=np.int64)
-    y_class = dataframe[TARGET_COLUMNS[0]].astype(int).map(CLASS_LABEL_MAP).to_numpy(dtype=np.int64)
+    #y_class = dataframe[TARGET_COLUMNS[0]].astype(int).map(CLASS_LABEL_MAP).to_numpy(dtype=np.int64)
+    y_class = dataframe[TARGET_COLUMNS[0]].astype(int).to_numpy(dtype=np.int64)
     y_home_goals = dataframe[TARGET_COLUMNS[1]].to_numpy(dtype=np.float32)
     y_away_goals = dataframe[TARGET_COLUMNS[2]].to_numpy(dtype=np.float32)
     return x_num, x_cat, y_class, y_home_goals, y_away_goals

@@ -59,19 +59,19 @@ class LSTMBackbone(nn.Module):
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
-        
+
         self.embedding_layers = nn.ModuleDict(
             {
                 name: nn.Embedding(num_embeddings, dim)
                 for name, (num_embeddings, dim) in embedding_settings.dimensions.items()
             }
         )
-        
+
         lstm_input_size = numerical_input_size + sum(dim for _, dim in embedding_settings.dimensions.values())
-        
+
         # Modificado: Mudamos para LayerNorm. Ela não liga se o tamanho do batch for 1.
         self.input_ln = nn.LayerNorm(lstm_input_size)
-        
+
         self.lstm = nn.LSTM(
             input_size=lstm_input_size,
             hidden_size=hidden_size,
@@ -79,13 +79,13 @@ class LSTMBackbone(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        
+
         # Modificado: Mudamos os blocos internos também para LayerNorm
         self.latent_dense1 = nn.Linear(hidden_size, hidden_size)
         self.latent_ln1 = nn.LayerNorm(hidden_size)
         self.latent_act1 = nn.ReLU()
         self.latent_drop1 = nn.Dropout(dropout)
-        
+
         self.latent_dense2 = nn.Linear(hidden_size, hidden_size)
         self.latent_ln2 = nn.LayerNorm(hidden_size)
         self.latent_act2 = nn.ReLU()
@@ -97,7 +97,8 @@ class LSTMBackbone(nn.Module):
             nn.Dropout(dropout * 0.5),
             nn.Linear(hidden_size // 2, 2)
         )
-        self.threshold = nn.Parameter(torch.tensor(0.5))
+        self.threshold_high = nn.Parameter(torch.tensor(1.0))
+        self.threshold_low = nn.Parameter(torch.tensor(0.9))
 
     def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = numerical_inputs.size()
@@ -207,11 +208,17 @@ def _collect_validation_predictions(
     categorical_batch_tensor = torch.stack(categorical_batches).to(device)
     with torch.no_grad():
         regression_outputs = model(numerical_batch_tensor, categorical_batch_tensor)
-        gol_diff = regression_outputs[:, 0] - regression_outputs[:, 1]
-        predicted_classes = (
-            (gol_diff.abs() > model.threshold).long() * (2 * (gol_diff > 0).long() - 1) + 1
-        ).cpu().numpy()
         predicted_goals = torch.exp(regression_outputs).cpu().numpy()
+
+        gols_mandante = predicted_goals[:, 0]
+        gols_visitante = predicted_goals[:, 1]
+
+        gols_ratio = gols_mandante / (gols_visitante + 1e-8)
+        predicted_classes = np.where(
+            gols_ratio > model.threshold_high.item(),
+            1,
+            np.where(gols_ratio < model.threshold_low.item(), -1, 0)
+        )
 
     for row_position, predicted_class, (predicted_home_goals, predicted_away_goals) in zip(row_positions, predicted_classes, predicted_goals):
         predicted_frame.loc[row_position, "pred_resultado_partida"] = int(predicted_class)
@@ -248,13 +255,29 @@ def _compute_epoch_metrics(
             total_regression_loss += float(regression_loss.item()) * batch_size
             total_samples += batch_size
 
-            gol_diff = regression_outputs[:, 0] - regression_outputs[:, 1]
-            target_diff = regression_targets[:, 0] - regression_targets[:, 1]
-            predictions = (gol_diff.abs() > model.threshold).long() * (2 * (gol_diff > 0).long() - 1)
-            targets = (target_diff.abs() > 0.5).long() * (2 * (target_diff > 0).long() - 1)
+            predicted_goals = torch.exp(regression_outputs)
+            gols_mandante = predicted_goals[:, 0]
+            gols_visitante = predicted_goals[:, 1]
+
+            gols_ratio = gols_mandante / (gols_visitante + 1e-8)
+            predictions = torch.where(
+                gols_ratio > model.threshold_high,
+                torch.tensor(1, device=device),
+                torch.where(gols_ratio < model.threshold_low, torch.tensor(-1, device=device), torch.tensor(0, device=device))
+            ).long()
+
+            target_gols_mandante = regression_targets[:, 0]
+            target_gols_visitante = regression_targets[:, 1]
+            target_ratio = target_gols_mandante / (target_gols_visitante + 1e-8)
+            targets = torch.where(
+                target_ratio > model.threshold_high,
+                torch.tensor(1, device=device),
+                torch.where(target_ratio < model.threshold_low, torch.tensor(-1, device=device), torch.tensor(0, device=device))
+            ).long()
+
             total_correct += int((predictions == targets).sum().item())
 
-            real_scale_predictions = torch.exp(regression_outputs)
+            real_scale_predictions = predicted_goals
             prediction_error = real_scale_predictions - regression_targets
             total_abs_error += float(prediction_error.abs().sum().item())
             total_squared_error += float((prediction_error ** 2).sum().item())
@@ -354,10 +377,26 @@ def train_model(
             running_loss += float(loss.item()) * batch_size_actual
             running_regression_loss += float(regression_loss.item()) * batch_size_actual
 
-            gol_diff = regression_outputs[:, 0] - regression_outputs[:, 1]
-            target_diff = regression_targets[:, 0] - regression_targets[:, 1]
-            predictions = (gol_diff.abs() > model.threshold).long() * (2 * (gol_diff > 0).long() - 1)
-            targets = (target_diff.abs() > model.threshold).long() * (2 * (target_diff > 0).long() - 1)
+            predicted_goals_train = torch.exp(regression_outputs)
+            gols_mandante_train = predicted_goals_train[:, 0]
+            gols_visitante_train = predicted_goals_train[:, 1]
+            gols_ratio_train = gols_mandante_train / (gols_visitante_train + 1e-8)
+
+            predictions = torch.where(
+                gols_ratio_train > model.threshold_high,
+                torch.tensor(1, device=runtime_device),
+                torch.where(gols_ratio_train < model.threshold_low, torch.tensor(-1, device=runtime_device), torch.tensor(0, device=runtime_device))
+            ).long()
+
+            target_gols_mandante = regression_targets[:, 0]
+            target_gols_visitante = regression_targets[:, 1]
+            target_ratio = target_gols_mandante / (target_gols_visitante + 1e-8)
+            targets = torch.where(
+                target_ratio > model.threshold_high,
+                torch.tensor(1, device=runtime_device),
+                torch.where(target_ratio < model.threshold_low, torch.tensor(-1, device=runtime_device), torch.tensor(0, device=runtime_device))
+            ).long()
+
             running_correct += int((predictions == targets).sum().item())
 
             _render_progress(
@@ -427,6 +466,8 @@ def train_model(
                         "class_mapping": bundle.class_mapping,
                         "best_epoch": best_epoch,
                         "best_validation_metrics": asdict(best_validation_metrics),
+                        "threshold_high": model.threshold_high.item(),
+                        "threshold_low": model.threshold_low.item(),
                     },
                     checkpoint_path,
                 )
@@ -487,6 +528,8 @@ def train_model(
                 "best_validation_metrics": asdict(best_validation_metrics) if best_validation_metrics is not None else None,
                 "validation_predictions_path": str(validation_predictions_path),
                 "test_metrics": asdict(test_metrics),
+                "threshold_high": model.threshold_high.item(),
+                "threshold_low": model.threshold_low.item(),
             }
         )
         torch.save(checkpoint, checkpoint_path)
@@ -495,12 +538,12 @@ def train_model(
 
 
 def main() -> None:
-    output = train_model(epochs=1000, sequence_length=5, batch_size=256, hidden_size=256,
-                         num_layers=3, dropout=0.6, learning_rate=5e-3, regression_weight=0.0,
+    output = train_model(epochs=10000, sequence_length=128, batch_size=512, hidden_size=128,
+                         num_layers=5, dropout=0.6, learning_rate=5e-5, regression_weight=0.0,
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=50)
+                         early_stopping_patience=1000)
 
 
     print("Dispositivo:", output["device"])

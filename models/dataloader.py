@@ -101,7 +101,8 @@ class MatchSequenceDataset(Dataset):
 
             numerical_features = torch.tensor(season_frame[numerical_feature_columns].to_numpy(), dtype=torch.float32)
             categorical_features = torch.tensor(season_frame[categorical_feature_columns].to_numpy(), dtype=torch.int64)
-            class_values = season_frame["resultado_partida"].astype(int).map(CLASS_LABEL_MAP).to_numpy()
+            #class_values = season_frame["resultado_partida"].astype(int).map(CLASS_LABEL_MAP).to_numpy()
+            class_values = season_frame["resultado_partida"].astype(int).to_numpy()
             regression_values = torch.tensor(season_frame[["gols_mandante", "gols_visitante"]].to_numpy(), dtype=torch.float32)
 
             for end_index in range(sequence_length - 1, len(season_frame)):
