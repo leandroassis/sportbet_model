@@ -50,7 +50,9 @@ FEATURE_COLUMNS = [
     "colocacao_media_mandante",
     'colocacao_media_visitante',
     'derrotas_seguidas_mandante',
-    'derrotas_seguidas_visitante' 
+    'derrotas_seguidas_visitante',
+    'elo_mandante',
+    'elo_visitante',
 ]
 
 
