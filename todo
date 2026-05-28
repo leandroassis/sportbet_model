@@ -10,3 +10,4 @@
 1. Tentar adicionar as features de chutes, defesas, impedimentos, faltas, escanteios, etc;
 2. Ao invés de prever H,D,A, tentar prever o número de gols de cada time (regressão) e depois converter isso para H,D,A;
 3. Tentar prever um vetor 3d (vitoria do mandante, empate, vitória do visitante) ao invés de uma unica saida H, D, A;
+4. tentar melhorar preenchimento de NaN aonde ocorre com colunas de missing indicators
