@@ -89,7 +89,7 @@ class MatchSequenceDataset(Dataset):
     ) -> None:
         self.sequences: list[torch.Tensor] = []
         self.categorical_sequences: list[torch.Tensor] = []
-        self.class_targets: list[int] = []
+        self.class_targets: list[torch.Tensor] = []
         self.regression_targets: list[torch.Tensor] = []
 
         # Combine the dataframes for sorting, keeping the original index
@@ -106,20 +106,20 @@ class MatchSequenceDataset(Dataset):
             numerical_features = torch.tensor(season_frame[numerical_feature_columns].to_numpy(), dtype=torch.float32)
             categorical_features = torch.tensor(season_frame[categorical_feature_columns].to_numpy(), dtype=torch.int64)
 
-            class_values = season_frame[['resultado_empate', 'resultado_vitoria_mandante', 'resultado_vitoria_visitante']].astype(int).to_numpy()
+            class_values = torch.tensor(season_frame[['resultado_empate', 'resultado_vitoria_mandante', 'resultado_vitoria_visitante']].to_numpy(), dtype=torch.float32)
             regression_values = torch.tensor(season_frame[["gols_mandante", "gols_visitante"]].to_numpy(), dtype=torch.float32)
 
             for end_index in range(sequence_length - 1, len(season_frame)):
                 start_index = end_index - sequence_length + 1
                 self.sequences.append(numerical_features[start_index : end_index + 1])
                 self.categorical_sequences.append(categorical_features[start_index : end_index + 1])
-                self.class_targets.append(int(class_values[end_index]))
+                self.class_targets.append(class_values[end_index])
                 self.regression_targets.append(regression_values[end_index])
 
     def __len__(self) -> int:
         return len(self.sequences)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
             self.sequences[index],
             self.categorical_sequences[index],
