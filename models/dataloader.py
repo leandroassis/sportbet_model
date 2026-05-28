@@ -205,7 +205,7 @@ def build_sequence_bundle(
     # 2. Calculate cardinalities from the separated categorical features dataframe
     cardinalities = {col: int(categorical_features_df[col].max() + 1) for col in categorical_feature_columns}
     embedding_dimensions = {
-        col: (cardinalities[col], min(50, (cardinalities[col]) // 2))
+        col: (cardinalities[col], min(50, (cardinalities[col]) + 1 // 2))
         for col in categorical_feature_columns
     }
     embedding_settings = EmbeddingSettings(cardinalities=cardinalities, dimensions=embedding_dimensions)

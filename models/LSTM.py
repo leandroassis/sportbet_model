@@ -387,7 +387,7 @@ def train_model(
 
     if model_type == "classifier":
         model = LSTMClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.2487, 0.6751, 1.3930], device=runtime_device), label_smoothing=0.01)  # Pesos iguais para as classes
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.3, 0.7, 1.4], device=runtime_device), label_smoothing=0.05)  # Pesos iguais para as classes
     else:
         model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
         criterion = nn.SmoothL1Loss(beta=2)#nn.PoissonNLLLoss(log_input=True)
