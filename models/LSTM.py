@@ -261,6 +261,7 @@ def _compute_epoch_metrics(
                 total_classification_loss += float(loss.item()) * batch_size
                 _, predictions = torch.max(outputs, 1)
                 _, target_classes = torch.max(class_targets, 1)
+                print(f"Predictions: {predictions.cpu().numpy()}, Targets: {target_classes.cpu().numpy()}")
                 total_correct += int((predictions == target_classes).sum().item())
             else:
                 loss = criterion(outputs, regression_targets)
@@ -332,8 +333,8 @@ def train_model(
         model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
         criterion = nn.PoissonNLLLoss(log_input=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.7)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=5e-2)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=100, factor=0.5)
     use_amp = runtime_device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -529,8 +530,8 @@ def train_model(
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=8, batch_size=64, hidden_size=256,
-                         num_layers=5, dropout=0.2, learning_rate=5e-3, model_type="regressor",
+    output = train_model(epochs=10000, sequence_length=32, batch_size=128, hidden_size=256,
+                         num_layers=3, dropout=0.6, learning_rate=5e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
