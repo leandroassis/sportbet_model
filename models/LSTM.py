@@ -662,12 +662,13 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=3, batch_size=64, hidden_size=512,
-                         num_layers=2, dropout=0.1, learning_rate=1e-3, model_type="classifier",
+    output = train_model(epochs=10000, sequence_length=100, batch_size=64, hidden_size=256,
+                         num_layers=2, dropout=0.3, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=20)
+                         early_stopping_patience=1000, 
+                         csv_path=Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv")
 
 
     print("Dispositivo:", output["device"])

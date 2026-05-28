@@ -4,9 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+import numpy as np
 
 
 TARGET_COLUMNS = ("resultado_empate", 'resultado_vitoria_mandante', 'resultado_vitoria_visitante',
@@ -136,7 +138,65 @@ def load_match_dataframe(csv_path: str | Path) -> pd.DataFrame:
     return dataframe.sort_values([YEAR_COLUMN, "data", "rodada"]).reset_index(drop=True)
 
 
+def scale_features(train_dataframe: pd.DataFrame, test_dataframe: pd.DataFrame, validation_dataframe: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+
+    dist_normais_labels = ['saldo_gols_mandante', 'saldo_gols_visitante', 'idade_media_titular_mandante',
+                        'idade_media_titular_visitante', 'colocacao_media_mandante', 'colocacao_media_visitante', 'elo_mandante', 'elo_visitante']
+
+    dist_cauda_longa_labels = ['publico', 'publico_max', 'valor_equipe_titular_mandante',
+                            'valor_equipe_titular_visitante']
+
+    dist_poisson_labels = ['vitorias_mandante', 'vitorias_visitante', 'empates_mandante', 
+                        'empates_visitante', 'derrotas_mandante', 'derrotas_visitante', 
+                        'gols_pro_mandante', 'gols_pro_visitante', 'gols_sofridos_mandante',
+                        'gols_sofridos_visitante', 'empates_confronto', 'vitorias_confronto_mandante', 
+                        'vitorias_confronto_visitante',
+                        'gols_marcados_media_mandante', 'gols_marcados_media_visitante',
+                            'gols_sofridos_media_mandante', 'gols_sofridos_media_visitante',
+                            'vitorias_seguidas_mandante', 'vitorias_seguidas_visitante',
+                            'derrotas_seguidas_mandante', 'derrotas_seguidas_visitante',
+                            'AvgCH', 'AvgCD', 'AvgCA']
+
+    dist_categoricas_ciclicas_labels = ['data', 'rodada', 'colocacao_mandante', 'colocacao_visitante', 'dia', 'mes']
+
+    # Initialize scalers
+    standard_scaler = StandardScaler()
+    min_max_scaler = MinMaxScaler()
+
+    # Apply StandardScaler to normally distributed columns
+    for col in dist_normais_labels:
+        if col in train_dataframe.columns and col in test_dataframe.columns and col in validation_dataframe.columns:
+            train_dataframe[col] = standard_scaler.fit_transform(train_dataframe[[col]])
+            test_dataframe[col] = standard_scaler.transform(test_dataframe[[col]])
+            validation_dataframe[col] = standard_scaler.transform(validation_dataframe[[col]])
+
+    # Apply log transformation and then MinMaxScaler to long-tail distributed columns
+    for col in dist_cauda_longa_labels:
+        if col in train_dataframe.columns and col in test_dataframe.columns and col in validation_dataframe.columns:
+            train_dataframe[col] = np.log1p(train_dataframe[col])
+            train_dataframe[col] = min_max_scaler.fit_transform(train_dataframe[[col]])
+
+            test_dataframe[col] = np.log1p(test_dataframe[col])
+            test_dataframe[col] = min_max_scaler.transform(test_dataframe[[col]])
+
+            validation_dataframe[col] = np.log1p(validation_dataframe[col])
+            validation_dataframe[col] = min_max_scaler.transform(validation_dataframe[[col]])
+
+    # Combine Poisson and cyclical categorical labels
+    dist_minmax_labels = dist_poisson_labels + dist_categoricas_ciclicas_labels
+
+    # Apply MinMaxScaler to the combined list of columns
+    for col in dist_minmax_labels:
+        if col in test_dataframe.columns and col in train_dataframe.columns and col in validation_dataframe.columns:
+            train_dataframe[col] = min_max_scaler.fit_transform(train_dataframe[[col]])
+            test_dataframe[col] = min_max_scaler.transform(test_dataframe[[col]])
+            validation_dataframe[col] = min_max_scaler.transform(validation_dataframe[[col]])
+
+    return train_dataframe, test_dataframe, validation_dataframe
+
 def split_match_dataframe(dataframe: pd.DataFrame) -> TemporalSplit:
+
+    dataframe = dataframe.sort_values([YEAR_COLUMN, "data", "rodada"]).reset_index(drop=True)
     
     minmaxscaler = MinMaxScaler()
     minmaxscaler.fit(dataframe[[YEAR_COLUMN]])
@@ -148,6 +208,8 @@ def split_match_dataframe(dataframe: pd.DataFrame) -> TemporalSplit:
     train[YEAR_COLUMN] = minmaxscaler.transform(train[[YEAR_COLUMN]])
     test[YEAR_COLUMN] = minmaxscaler.transform(test[[YEAR_COLUMN]])
     validation[YEAR_COLUMN] = minmaxscaler.transform(validation[[YEAR_COLUMN]])
+
+    train, test, validation = scale_features(train, test, validation)
 
     return TemporalSplit(
         train=train,
