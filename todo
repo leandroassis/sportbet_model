@@ -1,6 +1,5 @@
-0. adicionar metrica de partidas jogadas por rodada (para evitar vazamento de dados)
-0.1. usar numero de partidas jogadas para calcular media de gols por partida
-1. extrair mapas times, arbitro, tecnicos, estadios e demais features categoricas
+#0.1. usar numero de partidas jogadas para calcular media de gols por partida
+#1. extrair mapas times, arbitro, tecnicos, estadios e demais features categoricas
 2. extrair colunas de entradas para a rede
 3. implementar fine-tunning (opcional para periodos curtos de tempo)
 4. comparar classificacao modelo com escolher aleatoriamente e com escolher sempre a menor odd
@@ -10,4 +9,4 @@
 
 1. Tentar adicionar as features de chutes, defesas, impedimentos, faltas, escanteios, etc;
 2. Ao invés de prever H,D,A, tentar prever o número de gols de cada time (regressão) e depois converter isso para H,D,A;
-2.1. Tentar prever um vetor 3d (vitoria do mandante, empate, vitória do visitante) ao invés de uma unica saida H, D, A;
+3. Tentar prever um vetor 3d (vitoria do mandante, empate, vitória do visitante) ao invés de uma unica saida H, D, A;
