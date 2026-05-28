@@ -9,29 +9,21 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
-TARGET_COLUMNS = ("resultado_partida", "gols_mandante", "gols_visitante")
-CLASS_LABEL_MAP = {-1: 0, 0: 1, 1: 2}
+TARGET_COLUMNS = ("resultado_empate", 'resultado_vitoria_mandante', 'resultado_vitoria_visitante',
+                  "gols_mandante", "gols_visitante")
 YEAR_COLUMN = "ano_campeonato"
 FEATURE_COLUMNS = [
     "data",
     "rodada",
-    "estadio",
-    "arbitro",
     "publico",
     "publico_max",
-    "time_mandante",
-    "time_visitante",
-    "tecnico_mandante",
-    "tecnico_visitante",
     "colocacao_mandante",
     "colocacao_visitante",
     "valor_equipe_titular_mandante",
     "valor_equipe_titular_visitante",
     "idade_media_titular_mandante",
     "idade_media_titular_visitante",
-    "AvgCH",
-    "AvgCD",
-    "AvgCA",
+    "AvgCH", "AvgCD", "AvgCA",
     "gols_pro_mandante",
     "gols_pro_visitante",
     "gols_sofridos_mandante",
@@ -46,13 +38,26 @@ FEATURE_COLUMNS = [
     "derrotas_visitante",
     "dia",
     "mes",
+    "gols_sofridos_media_mandante",
+    "gols_sofridos_media_visitante",
+    "gols_marcados_media_mandante",
+    "gols_marcados_media_visitante",
+    "vitorias_confronto_mandante",
+    "vitorias_confronto_visitante",
+    "empates_confronto",
+    "vitorias_seguidas_mandante",
+    "vitorias_seguidas_visitante",
+    "colocacao_media_mandante",
+    'colocacao_media_visitante',
+    'derrotas_seguidas_mandante',
+    'derrotas_seguidas_visitante' 
 ]
 
 
 @dataclass(frozen=True)
 class EmbeddingSettings:
     cardinalities: dict[str, int]
-    dimensions: dict[str, int]
+    dimensions: dict[str, tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -71,7 +76,6 @@ class SequenceBundle:
     categorical_feature_columns: list[str]
     input_size: int
     embedding_settings: EmbeddingSettings
-    class_mapping: dict[int, int]
 
 
 class MatchSequenceDataset(Dataset):
@@ -101,8 +105,8 @@ class MatchSequenceDataset(Dataset):
 
             numerical_features = torch.tensor(season_frame[numerical_feature_columns].to_numpy(), dtype=torch.float32)
             categorical_features = torch.tensor(season_frame[categorical_feature_columns].to_numpy(), dtype=torch.int64)
-            #class_values = season_frame["resultado_partida"].astype(int).map(CLASS_LABEL_MAP).to_numpy()
-            class_values = season_frame["resultado_partida"].astype(int).to_numpy()
+
+            class_values = season_frame[['resultado_empate', 'resultado_vitoria_mandante', 'resultado_vitoria_visitante']].astype(int).to_numpy()
             regression_values = torch.tensor(season_frame[["gols_mandante", "gols_visitante"]].to_numpy(), dtype=torch.float32)
 
             for end_index in range(sequence_length - 1, len(season_frame)):
@@ -115,10 +119,11 @@ class MatchSequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.sequences)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
         return (
             self.sequences[index],
             self.categorical_sequences[index],
+            self.class_targets[index],
             self.regression_targets[index],
         )
 
@@ -132,7 +137,7 @@ def load_match_dataframe(csv_path: str | Path) -> pd.DataFrame:
 def split_match_dataframe(dataframe: pd.DataFrame) -> TemporalSplit:
     
     minmaxscaler = MinMaxScaler()
-    minmaxscaler.fit_transform(dataframe[[YEAR_COLUMN]])
+    minmaxscaler.fit(dataframe[[YEAR_COLUMN]])
 
     train=dataframe[dataframe[YEAR_COLUMN] <= 2022].copy()
     test=dataframe[dataframe[YEAR_COLUMN].isin([2023, 2024])].copy()
@@ -185,7 +190,9 @@ def build_sequence_bundle(
     dataframe = load_match_dataframe(csv_path)
     
     categorical_feature_columns = [
-        "arbitro", "estadio", "tecnico_mandante", "tecnico_visitante", "time_mandante", "time_visitante"
+        "arbitro", "estadio", "tecnico_mandante", "tecnico_visitante",
+        "time_mandante", "time_visitante", 'missing_colocacao_mandante',
+        'missing_colocacao_visitante', 'missing_rodada'
     ]
     
     # 1. Create a separate dataframe for categorical features
@@ -196,24 +203,21 @@ def build_sequence_bundle(
     # 2. Calculate cardinalities from the separated categorical features dataframe
     cardinalities = {col: int(categorical_features_df[col].max() + 1) for col in categorical_feature_columns}
     embedding_dimensions = {
-        col: (cardinalities[col], min(50, (cardinalities[col] + 1) // 2))
+        col: (cardinalities[col], min(50, (cardinalities[col]) // 2))
         for col in categorical_feature_columns
     }
     embedding_settings = EmbeddingSettings(cardinalities=cardinalities, dimensions=embedding_dimensions)
 
-    minmaxscaler = MinMaxScaler()
-    categorical_features_df[categorical_feature_columns] = minmaxscaler.fit_transform(categorical_features_df[categorical_feature_columns])
-
     # 3. Define numerical features
     numerical_feature_columns = [
-        col for col in FEATURE_COLUMNS if col not in categorical_feature_columns
+        col for col in FEATURE_COLUMNS if col not in categorical_feature_columns and col not in TARGET_COLUMNS
     ]
 
     numerical_feature_columns_in_df = [col for col in numerical_feature_columns if col in dataframe.columns]
     numerical_feature_columns = numerical_feature_columns_in_df.copy()
     
     # 4. The main dataframe for splitting should contain numerical features, targets, and sorting keys
-    main_df_cols = numerical_feature_columns + list(TARGET_COLUMNS) + [YEAR_COLUMN, "data", "rodada"]
+    main_df_cols = numerical_feature_columns + list(TARGET_COLUMNS) + [YEAR_COLUMN]
     # Remove duplicates and ensure all columns exist in the dataframe
     main_df_cols = list(dict.fromkeys([col for col in main_df_cols if col in dataframe.columns]))
     main_df = dataframe[main_df_cols].copy()
@@ -228,7 +232,7 @@ def build_sequence_bundle(
 
     # 7. Pass the correct dataframes to the loader builder
     train_loader = _build_loader(
-        splits.train, train_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=True, num_workers=num_workers
+        splits.train, train_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers
     )
     test_loader = _build_loader(
         splits.test, test_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers
@@ -249,6 +253,5 @@ def build_sequence_bundle(
         numerical_feature_columns=numerical_feature_columns,
         categorical_feature_columns=categorical_feature_columns,
         input_size=input_size,
-        embedding_settings=embedding_settings,
-        class_mapping=CLASS_LABEL_MAP.copy(),
-    )
+        embedding_settings=embedding_settings
+)
