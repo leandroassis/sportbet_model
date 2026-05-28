@@ -399,6 +399,7 @@ def train_model(
 
     history: list[dict[str, Any]] = []
     best_validation_loss = float("inf")
+    prev_train_loss = float("inf")
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_epoch = 0
     best_validation_metrics: EpochMetrics | None = None
@@ -513,7 +514,7 @@ def train_model(
             }
         )
 
-        if validation_metrics.loss > best_validation_loss:
+        if validation_metrics.loss < best_validation_loss:
             best_validation_loss = validation_metrics.loss
             best_state_dict = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
             best_epoch = epoch
@@ -537,7 +538,11 @@ def train_model(
                     checkpoint_path,
                 )
         else:
-            patience_counter += 1
+            # Overfitting: loss de treino continuou caindo, mas a de validação não
+            if train_metrics.loss < prev_train_loss:
+                patience_counter += 1
+
+        prev_train_loss = train_metrics.loss
 
         if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
             break
@@ -662,12 +667,12 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=100, batch_size=64, hidden_size=256,
-                         num_layers=2, dropout=0.3, learning_rate=1e-3, model_type="classifier",
+    output = train_model(epochs=10000, sequence_length=100, batch_size=64, hidden_size=16,
+                         num_layers=1, dropout=0.2, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=1000, 
+                         early_stopping_patience=25, 
                          csv_path=Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv")
 
 
