@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 import pandas as pd
+from sklearn.metrics import f1_score
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.cuda.amp.*")
 
@@ -43,6 +44,7 @@ class EpochMetrics:
     classification_loss: float = 0.0
     regression_loss: float = 0.0
     accuracy: float = 0.0
+    f1_score: float = 0.0
     mae: float = 0.0
     rmse: float = 0.0
 
@@ -294,6 +296,8 @@ def _compute_epoch_metrics(
     total_samples = 0
     total_abs_error = 0.0
     total_squared_error = 0.0
+    all_predictions = []
+    all_targets = []
 
     with torch.no_grad():
         for batch in loader:
@@ -308,6 +312,8 @@ def _compute_epoch_metrics(
                 target_classes = torch.argmax(class_targets, 1)
                 #print(f"Predictions: {outputs.cpu().numpy()}, Targets: {class_targets.cpu().numpy()}")
                 total_correct += int((predictions == target_classes).sum().item())
+                all_predictions.extend(predictions.cpu().numpy())
+                all_targets.extend(target_classes.cpu().numpy())
             else:
                 loss = criterion(outputs, regression_targets)
                 total_regression_loss += float(loss.item()) * batch_size
@@ -324,11 +330,17 @@ def _compute_epoch_metrics(
         return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
     regression_elements = total_samples * 2 if model_type == "regressor" else 1
+    
+    current_f1_score = 0.0
+    if model_type == "classifier" and total_samples > 0:
+        current_f1_score = float(f1_score(all_targets, all_predictions, average="macro", zero_division=0))
+
     return EpochMetrics(
         loss=total_loss / total_samples,
         classification_loss=total_classification_loss / total_samples,
         regression_loss=total_regression_loss / total_samples,
         accuracy=total_correct / total_samples if model_type == "classifier" else 0.0,
+        f1_score=current_f1_score,
         mae=total_abs_error / regression_elements if model_type == "regressor" else 0.0,
         rmse=float(np.sqrt(total_squared_error / regression_elements)) if model_type == "regressor" else 0.0,
     )
@@ -374,13 +386,13 @@ def train_model(
 
     if model_type == "classifier":
         model = LSTMClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.2487, 0.6751, 1.3930], device=runtime_device), label_smoothing=0.05)  # Pesos iguais para as classes
     else:
         model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
-        criterion = nn.PoissonNLLLoss(log_input=True)
+        criterion = nn.SmoothL1Loss(beta=2)#nn.PoissonNLLLoss(log_input=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=5e-2)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=100, factor=0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=25, factor=0.5)
     use_amp = runtime_device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -402,12 +414,14 @@ def train_model(
         running_classification_loss = 0.0
         running_correct = 0
         running_samples = 0
+        all_train_predictions = []
+        all_train_targets = []
         epoch_start = time.time()
         total_steps = len(bundle.train_loader)
 
         for step, batch in enumerate(bundle.train_loader, start=1):
             sequences, categorical_sequences, class_targets, regression_targets = _move_batch(batch, runtime_device)
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=False)
 
             with torch.cuda.amp.autocast(enabled=use_amp):
                 outputs = model(sequences, categorical_sequences)
@@ -435,6 +449,8 @@ def train_model(
                     _, predicted_classes = torch.max(outputs, 1)
                     _, target_classes = torch.max(class_targets, 1)
                     running_correct += int((predicted_classes == target_classes).sum().item())
+                    all_train_predictions.extend(predicted_classes.cpu().numpy())
+                    all_train_targets.extend(target_classes.cpu().numpy())
 
             _render_progress(
                 epoch=epoch,
@@ -449,11 +465,16 @@ def train_model(
         sys.stdout.write("\n")
         sys.stdout.flush()
 
+        train_f1_score = 0.0
+        if model_type == "classifier" and running_samples > 0:
+            train_f1_score = float(f1_score(all_train_targets, all_train_predictions, average="macro", zero_division=0))
+
         train_metrics = EpochMetrics(
             loss=running_loss / running_samples if running_samples else 0.0,
             classification_loss=running_classification_loss / running_samples if running_samples else 0.0,
             regression_loss=running_regression_loss / running_samples if running_samples else 0.0,
             accuracy=running_correct / running_samples if running_samples and model_type == "classifier" else 0.0,
+            f1_score=train_f1_score,
             mae=0.0,
             rmse=0.0,
         )
@@ -466,13 +487,18 @@ def train_model(
             criterion=criterion,
         )
 
-        summary_line = (
-            f"Epoch {epoch}/{epochs} final | "
-            f"train_loss={train_metrics.loss:.4f} train_acc={train_metrics.accuracy:.4f} "
-            f"val_acc={validation_metrics.accuracy:.4f}" if model_type == "classifier" else
-            f"mae={validation_metrics.mae:.4f} rmse={validation_metrics.rmse:.4f}"
-
-        )
+        if model_type == "classifier":
+            summary_line = (
+                f"Epoch {epoch}/{epochs} final | "
+                f"train_class_loss={train_metrics.classification_loss:.6f} train_acc={train_metrics.accuracy:.6f} train_f1={train_metrics.f1_score:.6f} | "
+                f"val_acc={validation_metrics.accuracy:.6f} val_f1={validation_metrics.f1_score:.6f}"
+            )
+        else:
+            summary_line = (
+                f"Epoch {epoch}/{epochs} final | "
+                f"train_reg_loss={train_metrics.regression_loss:.6f} train_mae={train_metrics.mae:.6f} train_rmse={train_metrics.rmse:.6f} | "
+                f"val_mae={validation_metrics.mae:.6f} val_rmse={validation_metrics.rmse:.6f}"
+            )
         sys.stdout.write(summary_line + "\n")
         sys.stdout.flush()
 
@@ -576,12 +602,12 @@ def train_model(
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=8, batch_size=256, hidden_size=256,
-                         num_layers=10, dropout=0.6, learning_rate=5e-2, model_type="classifier",
+    output = train_model(epochs=10000, sequence_length=12, batch_size=8, hidden_size=128,
+                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=2500)
+                         early_stopping_patience=25)
 
 
     print("Dispositivo:", output["device"])
