@@ -46,25 +46,55 @@ class EpochMetrics:
     mae: float = 0.0
     rmse: float = 0.0
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TemporalAttention(nn.Module):
+    """
+    Calcula o peso de cada timestep da LSTM para formar um vetor de contexto focado,
+    dando mais importância a rodadas chave na sequência histórica.
+    """
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.Tanh(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+
+    def forward(self, lstm_outputs: torch.Tensor) -> torch.Tensor:
+        # lstm_outputs shape: [batch_size, seq_len, hidden_size]
+        attn_weights = self.attention(lstm_outputs) # [batch_size, seq_len, 1]
+        attn_weights = F.softmax(attn_weights, dim=1)
+        
+        # Multiplica os outputs pelos pesos e soma ao longo da dimensão temporal
+        context_vector = torch.sum(attn_weights * lstm_outputs, dim=1) # [batch_size, hidden_size]
+        return context_vector
+
 
 class LSTMBackbone(nn.Module):
     def __init__(
         self,
         numerical_input_size: int,
-        embedding_settings: EmbeddingSettings,
+        embedding_settings, # Tipo assumido: EmbeddingSettings
         hidden_size: int = 128,
         num_layers: int = 2,
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
-        self.embedding_layers = nn.ModuleDict(
-            {
-                name: nn.Embedding(num_embeddings, dim)
-                for name, (num_embeddings, dim) in embedding_settings.dimensions.items()
-            }
-        )
+        
+        self.embedding_layers = nn.ModuleDict({
+            name: nn.Embedding(num_embeddings, dim)
+            for name, (num_embeddings, dim) in embedding_settings.dimensions.items()
+        })
+        
+        # Dropout extra para evitar overfitting precoce nos embeddings categóricos
+        self.embedding_dropout = nn.Dropout(dropout * 0.5)
+        
         lstm_input_size = numerical_input_size + sum(dim for _, dim in embedding_settings.dimensions.values())
         self.input_ln = nn.LayerNorm(lstm_input_size)
+        
         self.lstm = nn.LSTM(
             input_size=lstm_input_size,
             hidden_size=hidden_size,
@@ -72,10 +102,15 @@ class LSTMBackbone(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
+        
+        # Módulo de atenção temporal instanciado
+        self.attention = TemporalAttention(hidden_size)
+        
         self.latent_dense1 = nn.Linear(hidden_size, hidden_size)
         self.latent_ln1 = nn.LayerNorm(hidden_size)
         self.latent_act1 = nn.ReLU()
         self.latent_drop1 = nn.Dropout(dropout)
+        
         self.latent_dense2 = nn.Linear(hidden_size, hidden_size)
         self.latent_ln2 = nn.LayerNorm(hidden_size)
         self.latent_act2 = nn.ReLU()
@@ -86,20 +121,28 @@ class LSTMBackbone(nn.Module):
             self.embedding_layers[name](categorical_inputs[..., i])
             for i, name in enumerate(self.embedding_layers)
         ]
-        combined_input = torch.cat([numerical_inputs] + embeddings, dim=-1)
+        
+        cat_embeddings = self.embedding_dropout(torch.cat(embeddings, dim=-1))
+        combined_input = torch.cat([numerical_inputs, cat_embeddings], dim=-1)
         combined_input = self.input_ln(combined_input)
+        
         outputs, _ = self.lstm(combined_input)
-        last_state = outputs[:, -1, :]
-        x = self.latent_dense1(last_state)
+        
+        # Substituição da captura estática pelo vetor de contexto com atenção
+        context = self.attention(outputs)
+        
+        x = self.latent_dense1(context)
         x = self.latent_ln1(x)
         x = self.latent_act1(x)
         x = self.latent_drop1(x)
+        
         residual = x
         x = self.latent_dense2(x)
         x = self.latent_ln2(x)
         x = x + residual
         x = self.latent_act2(x)
         x = self.latent_drop2(x)
+        
         return x
 
 
@@ -109,6 +152,7 @@ class LSTMClassifier(nn.Module):
         self.backbone = backbone
         self.classification_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2), # LayerNorm adicionado para estabilidade
             nn.ReLU(),
             nn.Dropout(dropout * 0.5),
             nn.Linear(hidden_size // 2, 3)
@@ -125,15 +169,16 @@ class LSTMRegressor(nn.Module):
         self.backbone = backbone
         self.regression_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2), # LayerNorm adicionado para estabilidade
             nn.ReLU(),
             nn.Dropout(dropout * 0.5),
-            nn.Linear(hidden_size // 2, 2)
+            nn.Linear(hidden_size // 2, 2),
+            nn.Softplus() # Garante predição de gols não-negativa para funções como PoissonNLLLoss
         )
 
     def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> torch.Tensor:
         backbone_output = self.backbone(numerical_inputs, categorical_inputs)
         return self.regression_head(backbone_output)
-
 
 def get_device(device: str | None = None) -> torch.device:
     if device is not None:
@@ -259,15 +304,16 @@ def _compute_epoch_metrics(
             if model_type == "classifier":
                 loss = criterion(outputs, class_targets)
                 total_classification_loss += float(loss.item()) * batch_size
-                _, predictions = torch.max(outputs, 1)
-                _, target_classes = torch.max(class_targets, 1)
-                print(f"Predictions: {predictions.cpu().numpy()}, Targets: {target_classes.cpu().numpy()}")
+                predictions = torch.argmax(outputs, 1)
+                target_classes = torch.argmax(class_targets, 1)
+                #print(f"Predictions: {outputs.cpu().numpy()}, Targets: {class_targets.cpu().numpy()}")
                 total_correct += int((predictions == target_classes).sum().item())
             else:
                 loss = criterion(outputs, regression_targets)
                 total_regression_loss += float(loss.item()) * batch_size
                 predicted_goals = torch.exp(outputs)
                 prediction_error = predicted_goals - regression_targets
+                #print(f"Predicted goals: {predicted_goals.cpu().numpy()}, Target goals: {regression_targets.cpu().numpy()}")
                 total_abs_error += float(prediction_error.abs().sum().item())
                 total_squared_error += float((prediction_error ** 2).sum().item())
 
@@ -530,12 +576,12 @@ def train_model(
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=32, batch_size=128, hidden_size=256,
-                         num_layers=3, dropout=0.6, learning_rate=5e-3, model_type="classifier",
+    output = train_model(epochs=10000, sequence_length=8, batch_size=256, hidden_size=256,
+                         num_layers=10, dropout=0.6, learning_rate=5e-2, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=1000)
+                         early_stopping_patience=2500)
 
 
     print("Dispositivo:", output["device"])
