@@ -13,6 +13,7 @@ from torch import nn
 
 import pandas as pd
 from sklearn.metrics import f1_score
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.cuda.amp.*")
 
@@ -386,7 +387,7 @@ def train_model(
 
     if model_type == "classifier":
         model = LSTMClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.2487, 0.6751, 1.3930], device=runtime_device), label_smoothing=0.05)  # Pesos iguais para as classes
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.2487, 0.6751, 1.3930], device=runtime_device), label_smoothing=0.01)  # Pesos iguais para as classes
     else:
         model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
         criterion = nn.SmoothL1Loss(beta=2)#nn.PoissonNLLLoss(log_input=True)
@@ -601,18 +602,81 @@ def train_model(
     return result
 
 
+def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
+    save_dir.mkdir(parents=True, exist_ok=True)
+    history = output["history"]
+    test_metrics = output["test_metrics"]
+    
+    epochs = [h["epoch"] for h in history]
+    
+    train_loss = [h["train"]["loss"] for h in history]
+    val_loss = [h["validation"]["loss"] for h in history]
+    test_loss = test_metrics["loss"]
+    
+    train_acc = [h["train"]["accuracy"] for h in history]
+    val_acc = [h["validation"]["accuracy"] for h in history]
+    test_acc = test_metrics["accuracy"]
+    
+    train_f1 = [h["train"]["f1_score"] for h in history]
+    val_f1 = [h["validation"]["f1_score"] for h in history]
+    test_f1 = test_metrics["f1_score"]
+    
+    # Plot Loss
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_loss, label="Treino")
+    plt.plot(epochs, val_loss, label="Validação")
+    plt.axhline(y=test_loss, color='r', linestyle='--', label=f"Teste Final: {test_loss:.4f}")
+    plt.xlabel("Época")
+    plt.ylabel("Loss")
+    plt.title("Evolução da Loss (Perda)")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_dir / "loss_curve.png")
+    plt.close()
+    
+    # Plot Accuracy
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_acc, label="Treino")
+    plt.plot(epochs, val_acc, label="Validação")
+    plt.axhline(y=test_acc, color='r', linestyle='--', label=f"Teste Final: {test_acc:.4f}")
+    plt.xlabel("Época")
+    plt.ylabel("Acurácia")
+    plt.title("Evolução da Acurácia")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_dir / "accuracy_curve.png")
+    plt.close()
+    
+    # Plot F1 Score
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_f1, label="Treino")
+    plt.plot(epochs, val_f1, label="Validação")
+    plt.axhline(y=test_f1, color='r', linestyle='--', label=f"Teste Final: {test_f1:.4f}")
+    plt.xlabel("Época")
+    plt.ylabel("F1 Score")
+    plt.title("Evolução do F1 Score")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_dir / "f1_score_curve.png")
+    plt.close()
+
+
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=12, batch_size=8, hidden_size=128,
-                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="classifier",
+    output = train_model(epochs=10000, sequence_length=3, batch_size=64, hidden_size=512,
+                         num_layers=2, dropout=0.1, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=25)
+                         early_stopping_patience=20)
 
 
     print("Dispositivo:", output["device"])
     print("Métricas de teste:", output["test_metrics"])
     print("Melhor época:", output["best_epoch"])   
+    
+    plots_dir = Path(__file__).resolve().parents[0] / "plots"
+    plot_metrics(output, plots_dir)
+    print(f"Gráficos salvos em: {plots_dir}")
 
 
 if __name__ == "__main__":
