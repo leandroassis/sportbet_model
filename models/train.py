@@ -298,7 +298,7 @@ def train_model(
     prev_train_loss = float("inf")
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_epoch = 0
-    best_validation_metrics: EpochMetrics | None = None
+    best_test_metrics: EpochMetrics | None = None
     patience_counter = 0
 
     if checkpoint_path is not None:
@@ -385,36 +385,45 @@ def train_model(
             criterion=criterion,
         )
 
+        test_metrics = _compute_epoch_metrics(
+        model=model,
+        model_type=model_type,
+        loader=bundle.test_loader,
+        device=runtime_device,
+        criterion=criterion,
+        )
+
         if model_type == "classifier":
             summary_line = (
                 f"Epoch {epoch}/{epochs} final | "
                 f"train_class_loss={train_metrics.classification_loss:.6f} train_acc={train_metrics.accuracy:.6f} train_f1={train_metrics.f1_score:.6f} | "
-                f"val_acc={validation_metrics.accuracy:.6f} val_f1={validation_metrics.f1_score:.6f}"
+                f"test_acc={test_metrics.accuracy:.6f} test_f1={test_metrics.f1_score:.6f}"
             )
         else:
             summary_line = (
                 f"Epoch {epoch}/{epochs} final | "
                 f"train_reg_loss={train_metrics.regression_loss:.6f} train_mae={train_metrics.mae:.6f} train_rmse={train_metrics.rmse:.6f} | "
-                f"val_mae={validation_metrics.mae:.6f} val_rmse={validation_metrics.rmse:.6f}"
+                f"test_mae={test_metrics.mae:.6f} test_rmse={test_metrics.rmse:.6f}"
             )
         sys.stdout.write(summary_line + "\n")
         sys.stdout.flush()
 
-        scheduler.step(validation_metrics.loss)
+        scheduler.step(test_metrics.loss)
 
         history.append(
             {
                 "epoch": epoch,
                 "train": asdict(train_metrics),
+                "test": asdict(test_metrics),
                 "validation": asdict(validation_metrics),
             }
         )
 
-        if validation_metrics.accuracy > best_validation_loss:
-            best_validation_loss = validation_metrics.accuracy
+        if test_metrics.accuracy > best_validation_loss:
+            best_validation_loss = test_metrics.accuracy
             best_state_dict = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
             best_epoch = epoch
-            best_validation_metrics = validation_metrics
+            best_test_metrics = test_metrics
             patience_counter = 0
             if checkpoint_path is not None:
                 torch.save(
@@ -428,7 +437,7 @@ def train_model(
                         "num_layers": num_layers,
                         "dropout": dropout,
                         "best_epoch": best_epoch,
-                        "best_validation_metrics": asdict(best_validation_metrics),
+                        "best_test_metrics": asdict(best_test_metrics),
                         "model_type": model_type,
                     },
                     checkpoint_path,
@@ -453,13 +462,13 @@ def train_model(
     full_dataframe = load_match_dataframe(csv_path)
     validation_dataframe = split_match_dataframe(full_dataframe).validation
     test_dataframe = split_match_dataframe(full_dataframe).test
-    test_and_validation_dataframe = pd.concat([validation_dataframe, test_dataframe], ignore_index=True)
+    
     validation_predictions_path = Path(validation_predictions_path)
     validation_predictions_path.parent.mkdir(parents=True, exist_ok=True)
     validation_predictions = _collect_validation_predictions(
         model=model,
         model_type=model_type,
-        validation_dataframe=test_and_validation_dataframe,
+        validation_dataframe=validation_dataframe,
         numerical_feature_columns=bundle.numerical_feature_columns,
         categorical_feature_columns=bundle.categorical_feature_columns,
         sequence_length=sequence_length,
@@ -480,7 +489,7 @@ def train_model(
         "history": history,
         "test_metrics": asdict(test_metrics),
         "best_epoch": best_epoch,
-        "best_validation_metrics": asdict(best_validation_metrics) if best_validation_metrics is not None else None,
+        "best_test_metrics": asdict(best_test_metrics) if best_test_metrics is not None else None,
         "validation_predictions_path": str(validation_predictions_path),
         "bundle": bundle,
         "device": str(runtime_device),
@@ -493,7 +502,7 @@ def train_model(
             {
                 "history": history,
                 "best_epoch": best_epoch,
-                "best_validation_metrics": asdict(best_validation_metrics) if best_validation_metrics is not None else None,
+                "best_test_metrics": asdict(best_test_metrics) if best_test_metrics is not None else None,
                 "validation_predictions_path": str(validation_predictions_path),
                 "test_metrics": asdict(test_metrics),
             }
@@ -563,12 +572,12 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=3, batch_size=128, hidden_size=32,
-                         num_layers=2, dropout=0.2, learning_rate=1e-3, model_type="classifier",
+    output = train_model(epochs=10000, sequence_length=5, batch_size=32, hidden_size=256,
+                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=8, 
+                         early_stopping_patience=5, 
                          csv_path=Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv")
 
 
