@@ -67,20 +67,42 @@ class TemporalAttention(nn.Module):
         )
 
     def forward(self, lstm_outputs: torch.Tensor) -> torch.Tensor:
-        # lstm_outputs shape: [batch_size, seq_len, hidden_size]
-        attn_weights = self.attention(lstm_outputs) # [batch_size, seq_len, 1]
+        attn_weights = self.attention(lstm_outputs)
         attn_weights = F.softmax(attn_weights, dim=1)
-        
-        # Multiplica os outputs pelos pesos e soma ao longo da dimensão temporal
-        context_vector = torch.sum(attn_weights * lstm_outputs, dim=1) # [batch_size, hidden_size]
+        context_vector = torch.sum(attn_weights * lstm_outputs, dim=1)
         return context_vector
+
+
+class TabularFeatureExtractor(nn.Module):
+    """
+    Residual MLP com ativação GELU para pré-processar dados tabulares ruidosos.
+    """
+    def __init__(self, input_dim: int, output_dim: int, dropout: float = 0.2):
+        super().__init__()
+        
+        hidden_dim = output_dim * 2 
+        
+        self.feature_crossing = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim)
+        )
+        
+        self.skip_connection = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        transformed = self.feature_crossing(x)
+        return transformed + self.skip_connection(x)
 
 
 class LSTMBackbone(nn.Module):
     def __init__(
         self,
         numerical_input_size: int,
-        embedding_settings, # Tipo assumido: EmbeddingSettings
+        embedding_settings,
         hidden_size: int = 128,
         num_layers: int = 2,
         dropout: float = 0.2,
@@ -92,21 +114,30 @@ class LSTMBackbone(nn.Module):
             for name, (num_embeddings, dim) in embedding_settings.dimensions.items()
         })
         
-        # Dropout extra para evitar overfitting precoce nos embeddings categóricos
-        self.embedding_dropout = nn.Dropout(dropout * 0.5)
+        self.embedding_dropout = nn.Dropout(dropout * 0.8)
         
-        lstm_input_size = numerical_input_size + sum(dim for _, dim in embedding_settings.dimensions.values())
-        self.input_ln = nn.LayerNorm(lstm_input_size)
+        # Tamanho total da entrada bruta (numéricos + embeddings concatenados)
+        raw_input_size = numerical_input_size + sum(dim for _, dim in embedding_settings.dimensions.values())
+        self.input_ln = nn.LayerNorm(raw_input_size)
+        
+        # --------------------------------------------------------------------
+        # INSERÇÃO DO FEATURE EXTRACTOR
+        # Ele recebe o dado bruto e mastiga para o tamanho esperado pela LSTM
+        # --------------------------------------------------------------------
+        self.feature_extractor = TabularFeatureExtractor(
+            input_dim=raw_input_size,
+            output_dim=hidden_size,
+            dropout=dropout
+        )
         
         self.lstm = nn.LSTM(
-            input_size=lstm_input_size,
+            input_size=hidden_size, # Agora a LSTM recebe a saída do extrator
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
         
-        # Módulo de atenção temporal instanciado
         self.attention = TemporalAttention(hidden_size)
         
         self.latent_dense1 = nn.Linear(hidden_size, hidden_size)
@@ -127,13 +158,20 @@ class LSTMBackbone(nn.Module):
         
         cat_embeddings = self.embedding_dropout(torch.cat(embeddings, dim=-1))
         combined_input = torch.cat([numerical_inputs, cat_embeddings], dim=-1)
+        
+        # 1. Normaliza a entrada bruta
         combined_input = self.input_ln(combined_input)
         
-        outputs, _ = self.lstm(combined_input)
+        # 2. Passa pela MLP Residual para cruzar as features
+        refined_features = self.feature_extractor(combined_input)
         
-        # Substituição da captura estática pelo vetor de contexto com atenção
+        # 3. Alimenta a LSTM com as features limpas
+        outputs, _ = self.lstm(refined_features)
+        
+        # 4. Captura o contexto via Atenção
         context = self.attention(outputs)
         
+        # 5. Processamento Latente Final
         x = self.latent_dense1(context)
         x = self.latent_ln1(x)
         x = self.latent_act1(x)
@@ -155,7 +193,7 @@ class LSTMClassifier(nn.Module):
         self.backbone = backbone
         self.classification_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
-            nn.LayerNorm(hidden_size // 2), # LayerNorm adicionado para estabilidade
+            nn.LayerNorm(hidden_size // 2), 
             nn.ReLU(),
             nn.Dropout(dropout * 0.5),
             nn.Linear(hidden_size // 2, 3)
@@ -172,11 +210,11 @@ class LSTMRegressor(nn.Module):
         self.backbone = backbone
         self.regression_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
-            nn.LayerNorm(hidden_size // 2), # LayerNorm adicionado para estabilidade
+            nn.LayerNorm(hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout * 0.5),
             nn.Linear(hidden_size // 2, 2),
-            nn.Softplus() # Garante predição de gols não-negativa para funções como PoissonNLLLoss
+            nn.Softplus() 
         )
 
     def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> torch.Tensor:
@@ -387,13 +425,13 @@ def train_model(
 
     if model_type == "classifier":
         model = LSTMClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.3, 0.7, 1.4], device=runtime_device), label_smoothing=0.05)  # Pesos iguais para as classes
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.3, 0.7, 1.4], device=runtime_device), label_smoothing=0.4)  # Pesos iguais para as classes
     else:
         model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
         criterion = nn.SmoothL1Loss(beta=2)#nn.PoissonNLLLoss(log_input=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=5e-2)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=25, factor=0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=100, factor=0.4)
     use_amp = runtime_device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -667,12 +705,12 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=100, batch_size=64, hidden_size=16,
-                         num_layers=1, dropout=0.2, learning_rate=1e-3, model_type="classifier",
+    output = train_model(epochs=10000, sequence_length=80, batch_size=32, hidden_size=32,
+                         num_layers=2, dropout=0.1, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=25, 
+                         early_stopping_patience=15, 
                          csv_path=Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv")
 
 
