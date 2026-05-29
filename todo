@@ -2,7 +2,8 @@
 #1. extrair mapas times, arbitro, tecnicos, estadios e demais features categoricas
 2. extrair colunas de entradas para a rede
 3. implementar fine-tunning (opcional para periodos curtos de tempo)
-4. comparar classificacao modelo com escolher aleatoriamente e com escolher sempre a menor odd
+#4. comparar classificacao modelo com escolher aleatoriamente e com escolher sempre a menor odd
+5. rodar nos dados de teste e validacao e verificar se da para lucrar com o modelo (comparar com odd real e calcular lucro hipotetico)
 
 
 ## POSSIBILIDADES PARA MELHORAR O DATASET ##

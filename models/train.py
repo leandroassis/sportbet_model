@@ -43,23 +43,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         super().__init__()
-        self.alpha = alpha
+        # Recebe uma lista de pesos e converte para tensor
+        if alpha is None:
+            self.alpha = None
+        else:
+            self.alpha = torch.tensor(alpha, dtype=torch.float32)
+            
         self.gamma = gamma
         self.reduction = reduction
 
     def forward(self, inputs, targets):
-        # inputs: logits brutos da rede
-        # targets: labels verdadeiros (podem ser índices ou One-Hot)
+        # inputs: logits brutos da rede [batch_size, num_classes]
+        # targets: labels verdadeiros (índices ou One-Hot)
+
+        # 1. Tratar alvos One-Hot (necessário para buscar o peso correto de cada linha)
+        if targets.ndim > 1 and targets.shape[1] == inputs.shape[1]:
+            targets_indices = torch.argmax(targets, dim=1)
+        else:
+            targets_indices = targets
+
+        # 2. Cross Entropy pura (SEM pesos) para extrair p_t perfeitamente
         ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-ce_loss)
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        
+        # 3. Cálculo base da Focal Loss
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
 
+        # 4. Aplicação do vetor Alpha (Pesos das Classes)
+        if self.alpha is not None:
+            # Garante que o tensor de pesos esteja na mesma memória (CPU ou GPU) que os dados
+            if self.alpha.device != inputs.device:
+                self.alpha = self.alpha.to(inputs.device)
+            
+            # Coleta o peso específico para cada exemplo do lote
+            alpha_t = self.alpha[targets_indices]
+            
+            # Multiplica a perda pelo peso da classe
+            focal_loss = alpha_t * focal_loss
+
+        # 5. Redução final
         if self.reduction == 'mean':
             return focal_loss.mean()
         elif self.reduction == 'sum':
             return focal_loss.sum()
+        
         return focal_loss
 
 
@@ -280,21 +309,22 @@ def train_model(
         dropout=dropout,
     ).to(runtime_device)
 
+    pesos_classes = [1.248, 0.675, 1.393]
     if model_type == "classifier":
         model = LSTMClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
-        criterion = FocalLoss(alpha=1.0, gamma=2.0, reduction='mean')
+        criterion = FocalLoss(alpha=pesos_classes, gamma=3.0, reduction='mean')
         #nn.CrossEntropyLoss(weight=torch.tensor([1.3, 0.7, 1.4], device=runtime_device), label_smoothing=0.4)  # Pesos iguais para as classes
     else:
         model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
         criterion = nn.SmoothL1Loss(beta=2)#nn.PoissonNLLLoss(log_input=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=5e-2)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=4, factor=0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=10, factor=0.5)
     use_amp = runtime_device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     history: list[dict[str, Any]] = []
-    best_validation_loss = 0#float("inf")
+    best_test_performance = 0
     prev_train_loss = float("inf")
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_epoch = 0
@@ -419,8 +449,8 @@ def train_model(
             }
         )
 
-        if test_metrics.accuracy > best_validation_loss:
-            best_validation_loss = test_metrics.accuracy
+        if test_metrics.accuracy > best_test_performance:
+            best_test_performance = test_metrics.accuracy
             best_state_dict = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
             best_epoch = epoch
             best_test_metrics = test_metrics
@@ -484,10 +514,19 @@ def train_model(
         criterion=criterion,
     )
 
+    validation_metrics = _compute_epoch_metrics(
+        model=model,
+        model_type=model_type,
+        loader=bundle.validation_loader,
+        device=runtime_device,
+        criterion=criterion,
+    )
+
     result: dict[str, Any] = {
         "model": model,
         "history": history,
         "test_metrics": asdict(test_metrics),
+        "validation_metrics": asdict(validation_metrics),
         "best_epoch": best_epoch,
         "best_test_metrics": asdict(best_test_metrics) if best_test_metrics is not None else None,
         "validation_predictions_path": str(validation_predictions_path),
@@ -521,21 +560,21 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
     
     train_loss = [h["train"]["loss"] for h in history]
     val_loss = [h["validation"]["loss"] for h in history]
-    test_loss = test_metrics["loss"]
+    test_loss = [h['test']['loss'] for h in history]
     
     train_acc = [h["train"]["accuracy"] for h in history]
     val_acc = [h["validation"]["accuracy"] for h in history]
-    test_acc = test_metrics["accuracy"]
+    test_acc = [h['test']['accuracy'] for h in history]
     
     train_f1 = [h["train"]["f1_score"] for h in history]
     val_f1 = [h["validation"]["f1_score"] for h in history]
-    test_f1 = test_metrics["f1_score"]
+    test_f1 = [h['test']['f1_score'] for h in history]
     
     # Plot Loss
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, train_loss, label="Treino")
+    plt.plot(epochs, test_loss, label="Teste")
     plt.plot(epochs, val_loss, label="Validação")
-    plt.axhline(y=test_loss, color='r', linestyle='--', label=f"Teste Final: {test_loss:.4f}")
     plt.xlabel("Época")
     plt.ylabel("Loss")
     plt.title("Evolução da Loss (Perda)")
@@ -547,8 +586,8 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
     # Plot Accuracy
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, train_acc, label="Treino")
+    plt.plot(epochs, test_acc, label="Teste")
     plt.plot(epochs, val_acc, label="Validação")
-    plt.axhline(y=test_acc, color='r', linestyle='--', label=f"Teste Final: {test_acc:.4f}")
     plt.xlabel("Época")
     plt.ylabel("Acurácia")
     plt.title("Evolução da Acurácia")
@@ -560,8 +599,8 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
     # Plot F1 Score
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, train_f1, label="Treino")
+    plt.plot(epochs, test_f1, label="Teste")
     plt.plot(epochs, val_f1, label="Validação")
-    plt.axhline(y=test_f1, color='r', linestyle='--', label=f"Teste Final: {test_f1:.4f}")
     plt.xlabel("Época")
     plt.ylabel("F1 Score")
     plt.title("Evolução do F1 Score")
@@ -572,7 +611,7 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 
 def main() -> None:
-    output = train_model(epochs=10000, sequence_length=5, batch_size=32, hidden_size=256,
+    output = train_model(epochs=5000, sequence_length=3, batch_size=8, hidden_size=32,
                          num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
@@ -583,6 +622,7 @@ def main() -> None:
 
     print("Dispositivo:", output["device"])
     print("Métricas de teste:", output["test_metrics"])
+    print("Métricas de validação:", output["validation_metrics"])
     print("Melhor época:", output["best_epoch"])   
     
     plots_dir = Path(__file__).resolve().parents[0] / "plots"
