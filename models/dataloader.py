@@ -57,6 +57,9 @@ FEATURE_COLUMNS = [
     'elo_visitante',
 ]
 
+FEATURES_TO_DROP = ['gols_sofridos_media_visitante', 'gols_marcados_media_visitante', 'gols_pro_mandante', 'vitorias_confronto_mandante', 'empates_confronto',
+                    'derrotas_mandante', 'colocacao_media_mandante', 'publico', 'rodada', 'dia', 'valor_equipe_titular_visitante', 'idade_media_titular_mandante',
+                    'idade_media_titular_visitante', 'valor_equipe_titular_mandante', 'missing_colocacao_visitante', 'publico_max', 'missing_rodada']
 
 @dataclass(frozen=True)
 class EmbeddingSettings:
@@ -100,10 +103,9 @@ class MatchSequenceDataset(Dataset):
         num_df_reset = numerical_dataframe.reset_index(drop=True)
         cat_df_reset = categorical_dataframe[categorical_feature_columns].reset_index(drop=True)
         combined_df = pd.concat([num_df_reset, cat_df_reset], axis=1)
-        ordered = combined_df.sort_values([YEAR_COLUMN, "data", "rodada"])
+        ordered = combined_df.sort_values([YEAR_COLUMN])
 
         for _, season_frame in ordered.groupby(YEAR_COLUMN, sort=True):
-            season_frame = season_frame.sort_values(["data", "rodada"]).reset_index(drop=True)
             if len(season_frame) < sequence_length:
                 continue
 
@@ -194,10 +196,7 @@ def scale_features(train_dataframe: pd.DataFrame, test_dataframe: pd.DataFrame, 
 
     return train_dataframe, test_dataframe, validation_dataframe
 
-def split_match_dataframe(dataframe: pd.DataFrame) -> TemporalSplit:
-
-    dataframe = dataframe.sort_values([YEAR_COLUMN, "data", "rodada"]).reset_index(drop=True)
-    
+def split_match_dataframe(dataframe: pd.DataFrame) -> TemporalSplit:   
     minmaxscaler = MinMaxScaler()
     minmaxscaler.fit(dataframe[[YEAR_COLUMN]])
 
@@ -252,6 +251,8 @@ def build_sequence_bundle(
 ) -> SequenceBundle:
     
     dataframe = load_match_dataframe(csv_path)
+    dataframe = dataframe.sort_values([YEAR_COLUMN, "data", "rodada"]).reset_index(drop=True)
+    dataframe = dataframe.drop(columns=FEATURES_TO_DROP)
     
     categorical_feature_columns = [
         "arbitro", "estadio", "tecnico_mandante", "tecnico_visitante",
@@ -296,7 +297,7 @@ def build_sequence_bundle(
 
     # 7. Pass the correct dataframes to the loader builder
     train_loader = _build_loader(
-        splits.train, train_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers
+        splits.train, train_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=True, num_workers=num_workers
     )
     test_loader = _build_loader(
         splits.test, test_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers
