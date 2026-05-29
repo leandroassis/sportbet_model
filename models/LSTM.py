@@ -147,6 +147,10 @@ class LSTMClassifier(nn.Module):
             nn.Dropout(dropout * 0.5),
             nn.Linear(hidden_size // 2, 3)
         )
+        # Distribuição: Empate (~0.27), Mandante (~0.49), Visitante (~0.24)
+        initial_bias = torch.tensor([0.27, 0.49, 0.24]) 
+        # Usando o logaritmo das probabilidades
+        self.classification_head[-1].bias.data = torch.log(initial_bias)
 
     def forward(self, numerical_inputs: torch.Tensor, categorical_inputs: torch.Tensor) -> torch.Tensor:
         backbone_output = self.backbone(numerical_inputs, categorical_inputs)
