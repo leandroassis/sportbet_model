@@ -159,9 +159,13 @@ def _collect_validation_predictions(
     device: torch.device,
 ) -> Any:
     predicted_frame = validation_dataframe.copy()
-    predicted_frame["pred_resultado_partida"] = np.nan
-    predicted_frame["pred_gols_mandante"] = np.nan
-    predicted_frame["pred_gols_visitante"] = np.nan
+    if model_type == "classifier":
+        predicted_frame["pred_resultado_empate"] = np.nan
+        predicted_frame["pred_resultado_vitoria_mandante"] = np.nan
+        predicted_frame["pred_resultado_vitoria_visitante"] = np.nan
+    else:
+        predicted_frame["pred_gols_mandante"] = np.nan
+        predicted_frame["pred_gols_visitante"] = np.nan
 
     model.eval()
     numerical_batches: list[torch.Tensor] = []
@@ -190,17 +194,18 @@ def _collect_validation_predictions(
     with torch.no_grad():
         outputs = model(numerical_batch_tensor, categorical_batch_tensor)
         if model_type == "classifier":
-            _, predicted_classes = torch.max(outputs, 1)
-            predicted_classes = predicted_classes.cpu().numpy()
+            predicted_classes = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
             predicted_goals = np.full((len(predicted_classes), 2), np.nan)
         else:
             predicted_goals = torch.exp(outputs).cpu().numpy()
-            predicted_classes = np.full(len(predicted_goals), np.nan)
+            predicted_classes = np.full((len(predicted_goals), 3), np.nan)
 
     for row_position, predicted_class, (predicted_home_goals, predicted_away_goals) in zip(row_positions, predicted_classes, predicted_goals):
-        if not np.isnan(predicted_class):
-            predicted_frame.loc[row_position, "pred_resultado_partida"] = int(predicted_class)
-        if not np.isnan(predicted_home_goals):
+        if model_type == "classifier":
+            predicted_frame.loc[row_position, "pred_resultado_empate"] = predicted_class[0]
+            predicted_frame.loc[row_position, "pred_resultado_vitoria_mandante"] = predicted_class[1]
+            predicted_frame.loc[row_position, "pred_resultado_vitoria_visitante"] = predicted_class[2]
+        else:
             predicted_frame.loc[row_position, "pred_gols_mandante"] = float(predicted_home_goals)
             predicted_frame.loc[row_position, "pred_gols_visitante"] = float(predicted_away_goals)
 
@@ -463,7 +468,7 @@ def train_model(
             }
         )
 
-        if test_metrics.accuracy > best_test_performance and model_type == "classifier" or (model_type == "regressor" and test_metrics.mae < best_test_performance):
+        if (test_metrics.accuracy > best_test_performance and model_type == "classifier") or (model_type == "regressor" and test_metrics.mae < best_test_performance):
             best_test_performance = test_metrics.accuracy if model_type == "classifier" else test_metrics.mae
             best_state_dict = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
             best_epoch = epoch
@@ -626,7 +631,7 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 def main() -> None:
     output = train_model(epochs=5000, sequence_length=3, batch_size=8, hidden_size=32,
-                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="classifier",
+                         num_layers=2, dropout=0.2, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
