@@ -449,8 +449,8 @@ def train_model(
             }
         )
 
-        if test_metrics.accuracy > best_test_performance:
-            best_test_performance = test_metrics.accuracy
+        if test_metrics.accuracy > best_test_performance and model_type == "classifier" or (model_type == "regressor" and test_metrics.mae < best_test_performance):
+            best_test_performance = test_metrics.accuracy if model_type == "classifier" else test_metrics.mae
             best_state_dict = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
             best_epoch = epoch
             best_test_metrics = test_metrics
@@ -612,7 +612,7 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 def main() -> None:
     output = train_model(epochs=5000, sequence_length=3, batch_size=8, hidden_size=32,
-                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="classifier",
+                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="regressor",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
