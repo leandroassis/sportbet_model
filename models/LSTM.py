@@ -35,7 +35,7 @@ class TabularFeatureExtractor(nn.Module):
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(dropout*0.5),
             nn.Linear(hidden_dim, output_dim),
             nn.LayerNorm(output_dim)
         )

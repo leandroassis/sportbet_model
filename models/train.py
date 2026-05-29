@@ -322,7 +322,7 @@ def train_model(
         dropout=dropout,
     ).to(runtime_device)
 
-    pesos_classes = [1.248, 0.675, 1.393]
+    pesos_classes = [1.248, 0.6, 1.3]
     if model_type == "classifier":
         model = LSTMClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
         criterion = FocalLoss(alpha=pesos_classes, gamma=2.0, reduction='mean')
@@ -331,13 +331,13 @@ def train_model(
         model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
         criterion = nn.PoissonNLLLoss(log_input=False) #nn.SmoothL1Loss(beta=2)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=5e-2)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.7, min_lr=1e-6, cooldown=5)
     use_amp = runtime_device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     history: list[dict[str, Any]] = []
-    best_test_performance = 0
+    best_test_performance = float("inf")
     prev_train_loss = float("inf")
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_epoch = 0
@@ -377,6 +377,7 @@ def train_model(
                     classification_loss = torch.tensor(0.0)
 
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -468,8 +469,8 @@ def train_model(
             }
         )
 
-        if (test_metrics.accuracy > best_test_performance and model_type == "classifier") or (model_type == "regressor" and test_metrics.mae < best_test_performance):
-            best_test_performance = test_metrics.accuracy if model_type == "classifier" else test_metrics.mae
+        if (test_metrics.loss < best_test_performance and model_type == "classifier") or (model_type == "regressor" and test_metrics.mae < best_test_performance):
+            best_test_performance = test_metrics.loss if model_type == "classifier" else test_metrics.mae
             best_state_dict = {name: tensor.detach().cpu() for name, tensor in model.state_dict().items()}
             best_epoch = epoch
             best_test_metrics = test_metrics
@@ -493,7 +494,7 @@ def train_model(
                 )
         else:
             # Overfitting: loss de treino continuou caindo, mas a de validação não
-            if train_metrics.loss < prev_train_loss:
+            if train_metrics.loss < test_metrics.loss:
                 patience_counter += 1
 
         prev_train_loss = train_metrics.loss if train_metrics.loss < prev_train_loss else prev_train_loss
@@ -630,12 +631,12 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 
 def main() -> None:
-    output = train_model(epochs=5000, sequence_length=3, batch_size=256, hidden_size=32,
-                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="classifier",
+    output = train_model(epochs=5000, sequence_length=64, batch_size=256, hidden_size=64,
+                         num_layers=2, dropout=0.25, learning_rate=1e-4, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=20, 
+                         early_stopping_patience=8, 
                          csv_path=Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv")
 
 
