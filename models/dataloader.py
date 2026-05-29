@@ -201,8 +201,8 @@ def split_match_dataframe(dataframe: pd.DataFrame) -> TemporalSplit:
     minmaxscaler = MinMaxScaler()
     minmaxscaler.fit(dataframe[[YEAR_COLUMN]])
 
-    train=dataframe[dataframe[YEAR_COLUMN] <= 2023].copy()
-    test=dataframe[dataframe[YEAR_COLUMN].isin([2024, 2025])].copy()
+    train=dataframe[dataframe[YEAR_COLUMN] <= 2024].copy()
+    test=dataframe[dataframe[YEAR_COLUMN].isin([2025])].copy()
     validation=dataframe[dataframe[YEAR_COLUMN].isin([2026])].copy()
 
     train[YEAR_COLUMN] = minmaxscaler.transform(train[[YEAR_COLUMN]])
