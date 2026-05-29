@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 import numpy as np
 
@@ -226,7 +226,9 @@ def _build_loader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
+    is_train: bool = True
 ) -> DataLoader:
+
     dataset = MatchSequenceDataset(
         numerical_dataframe=numerical_df,
         categorical_dataframe=categorical_df,
@@ -234,13 +236,26 @@ def _build_loader(
         categorical_feature_columns=categorical_feature_columns,
         sequence_length=sequence_length,
     )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
+    if is_train:
+        # Pega os targets (assumindo que class_targets é One-Hot)
+        targets = torch.stack([t for _, _, t, _ in dataset])
+        class_indices = torch.argmax(targets, dim=1)
+        
+        # Calcula o peso de cada amostra (inverso da frequência da classe)
+        class_counts = torch.bincount(class_indices)
+        class_weights = 1.0 / class_counts.float()
+        sample_weights = class_weights[class_indices]
+        
+        # Cria o sampler (ele fará o shuffle internamente baseado nos pesos)
+        sampler = WeightedRandomSampler(
+            weights=sample_weights, 
+            num_samples=len(sample_weights), 
+            replacement=True
+        )
+        
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=True)
+    else:
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
 
 def build_sequence_bundle(
@@ -297,13 +312,16 @@ def build_sequence_bundle(
 
     # 7. Pass the correct dataframes to the loader builder
     train_loader = _build_loader(
-        splits.train, train_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=True, num_workers=num_workers
+        splits.train, train_categorical_features, numerical_feature_columns, categorical_feature_columns,
+        sequence_length, batch_size, shuffle=True, num_workers=num_workers, is_train=True
     )
     test_loader = _build_loader(
-        splits.test, test_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers
+        splits.test, test_categorical_features, numerical_feature_columns, categorical_feature_columns,
+        sequence_length, batch_size, shuffle=False, num_workers=num_workers
     )
     validation_loader = _build_loader(
-        splits.validation, validation_categorical_features, numerical_feature_columns, categorical_feature_columns, sequence_length, batch_size, shuffle=False, num_workers=num_workers
+        splits.validation, validation_categorical_features, numerical_feature_columns, categorical_feature_columns,
+        sequence_length, batch_size, shuffle=False, num_workers=num_workers
     )
 
     # Calculate the final input size for the models

@@ -174,7 +174,7 @@ def _collect_validation_predictions(
 
     ordered = validation_dataframe.sort_values([YEAR_COLUMN])
     for _, season_frame in ordered.groupby(YEAR_COLUMN, sort=True):
-        season_frame = season_frame.reset_index(drop=True)
+        season_frame = season_frame.reset_index()
         if len(season_frame) < sequence_length:
             continue
 
@@ -332,7 +332,7 @@ def train_model(
         criterion = nn.PoissonNLLLoss(log_input=False) #nn.SmoothL1Loss(beta=2)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=5e-2)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=2, factor=0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
     use_amp = runtime_device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -631,11 +631,11 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 def main() -> None:
     output = train_model(epochs=5000, sequence_length=3, batch_size=256, hidden_size=32,
-                         num_layers=2, dropout=0.2, learning_rate=1e-4, model_type="classifier",
+                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=5, 
+                         early_stopping_patience=20, 
                          csv_path=Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv")
 
 
