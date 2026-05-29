@@ -99,6 +99,7 @@ class EpochMetrics:
     regression_loss: float = 0.0
     accuracy: float = 0.0
     f1_score: float = 0.0
+    brier_score: float = 0.0
     mae: float = 0.0
     rmse: float = 0.0
 
@@ -217,6 +218,7 @@ def _compute_epoch_metrics(
     total_loss = 0.0
     total_regression_loss = 0.0
     total_classification_loss = 0.0
+    total_squared_prob_error = 0.0
     total_correct = 0
     total_samples = 0
     total_abs_error = 0.0
@@ -233,6 +235,11 @@ def _compute_epoch_metrics(
             if model_type == "classifier":
                 loss = criterion(outputs, class_targets)
                 total_classification_loss += float(loss.item()) * batch_size
+                
+                probabilities = F.softmax(outputs, dim=1)
+                brier_error = ((probabilities - class_targets) ** 2).sum()
+                total_squared_prob_error += float(brier_error.item())
+                
                 predictions = torch.argmax(outputs, 1)
                 target_classes = torch.argmax(class_targets, 1)
                 #print(f"Predictions: {outputs.cpu().numpy()}, Targets: {class_targets.cpu().numpy()}")
@@ -252,7 +259,7 @@ def _compute_epoch_metrics(
             total_samples += batch_size
 
     if total_samples == 0:
-        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return EpochMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
     regression_elements = total_samples * 2 if model_type == "regressor" else 1
     
@@ -266,6 +273,7 @@ def _compute_epoch_metrics(
         regression_loss=total_regression_loss / total_samples,
         accuracy=total_correct / total_samples if model_type == "classifier" else 0.0,
         f1_score=current_f1_score,
+        brier_score=total_squared_prob_error / total_samples if model_type == "classifier" else 0.0,
         mae=total_abs_error / regression_elements if model_type == "regressor" else 0.0,
         rmse=float(np.sqrt(total_squared_error / regression_elements)) if model_type == "regressor" else 0.0,
     )
@@ -312,11 +320,11 @@ def train_model(
     pesos_classes = [1.248, 0.675, 1.393]
     if model_type == "classifier":
         model = LSTMClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
-        criterion = FocalLoss(alpha=pesos_classes, gamma=3.0, reduction='mean')
+        criterion = FocalLoss(alpha=pesos_classes, gamma=2.0, reduction='mean')
         #nn.CrossEntropyLoss(weight=torch.tensor([1.3, 0.7, 1.4], device=runtime_device), label_smoothing=0.4)  # Pesos iguais para as classes
     else:
         model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
-        criterion = nn.SmoothL1Loss(beta=2)#nn.PoissonNLLLoss(log_input=True)
+        criterion = nn.PoissonNLLLoss(log_input=False) #nn.SmoothL1Loss(beta=2)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=5e-2)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=10, factor=0.5)
@@ -340,6 +348,7 @@ def train_model(
         running_loss = 0.0
         running_regression_loss = 0.0
         running_classification_loss = 0.0
+        running_brier_score = 0.0
         running_correct = 0
         running_samples = 0
         all_train_predictions = []
@@ -380,6 +389,10 @@ def train_model(
                     all_train_predictions.extend(predicted_classes.cpu().numpy())
                     all_train_targets.extend(target_classes.cpu().numpy())
 
+                    probabilities = F.softmax(outputs, dim=1)
+                    brier_error = ((probabilities - class_targets) ** 2).sum()
+                    running_brier_score += float(brier_error.item())
+
             _render_progress(
                 epoch=epoch,
                 epochs=epochs,
@@ -403,6 +416,7 @@ def train_model(
             regression_loss=running_regression_loss / running_samples if running_samples else 0.0,
             accuracy=running_correct / running_samples if running_samples and model_type == "classifier" else 0.0,
             f1_score=train_f1_score,
+            brier_score=running_brier_score / running_samples if running_samples and model_type == "classifier" else 0.0,
             mae=0.0,
             rmse=0.0,
         )
@@ -426,8 +440,8 @@ def train_model(
         if model_type == "classifier":
             summary_line = (
                 f"Epoch {epoch}/{epochs} final | "
-                f"train_class_loss={train_metrics.classification_loss:.6f} train_acc={train_metrics.accuracy:.6f} train_f1={train_metrics.f1_score:.6f} | "
-                f"test_acc={test_metrics.accuracy:.6f} test_f1={test_metrics.f1_score:.6f}"
+                f"train_class_loss={train_metrics.classification_loss:.6f} train_acc={train_metrics.accuracy:.6f} train_f1={train_metrics.f1_score:.6f} train_brier={train_metrics.brier_score:.6f} | "
+                f"test_acc={test_metrics.accuracy:.6f} test_f1={test_metrics.f1_score:.6f} test_brier={test_metrics.brier_score:.6f}"
             )
         else:
             summary_line = (
@@ -612,7 +626,7 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 def main() -> None:
     output = train_model(epochs=5000, sequence_length=3, batch_size=8, hidden_size=32,
-                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="regressor",
+                         num_layers=2, dropout=0.4, learning_rate=1e-3, model_type="classifier",
                          save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
                          best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
                          validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
