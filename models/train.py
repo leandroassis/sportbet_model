@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,10 @@ try:
         FEATURE_COLUMNS,
         YEAR_COLUMN,
         EmbeddingSettings,
+        MatchSequenceDataset,
         SequenceBundle,
+        SiameseMatchDataset,
+        TabularMatchDataset,
         build_sequence_bundle,
         load_match_dataframe,
         split_match_dataframe,
@@ -32,7 +36,10 @@ except ImportError:  # pragma: no cover - fallback when run as a standalone scri
         FEATURE_COLUMNS,
         YEAR_COLUMN,
         EmbeddingSettings,
+        MatchSequenceDataset,
         SequenceBundle,
+        SiameseMatchDataset,
+        TabularMatchDataset,
         build_sequence_bundle,
         load_match_dataframe,
         split_match_dataframe,
@@ -108,20 +115,89 @@ try:
 except ImportError:
     from LSTM import LSTMBackbone, LSTMClassifier, LSTMRegressor
 
+try:
+    from .TabularMLP import TabularMLPBackbone, TabularClassifier, TabularRegressor
+except ImportError:
+    from TabularMLP import TabularMLPBackbone, TabularClassifier, TabularRegressor
+
+try:
+    from .SiameseLSTM import SiameseLSTMBackbone, SiameseClassifier, SiameseRegressor
+except ImportError:
+    from SiameseLSTM import SiameseLSTMBackbone, SiameseClassifier, SiameseRegressor
+
 def get_device(device: str | None = None) -> torch.device:
     if device is not None:
         return torch.device(device)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _move_batch(batch: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], device: torch.device):
-    sequences, categorical_sequences, class_targets, regression_targets = batch
-    return (
-        sequences.to(device, non_blocking=True),
-        categorical_sequences.to(device, non_blocking=True),
-        class_targets.to(device, non_blocking=True),
-        regression_targets.to(device, non_blocking=True),
-    )
+def _build_model(
+    arch: str,
+    model_type: str,
+    bundle: SequenceBundle,
+    hidden_size: int,
+    num_layers: int,
+    dropout: float,
+    runtime_device: torch.device,
+) -> nn.Module:
+    if arch == "legacy":
+        backbone = LSTMBackbone(
+            numerical_input_size=len(bundle.numerical_feature_columns),
+            embedding_settings=bundle.embedding_settings,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        if model_type == "classifier":
+            model = LSTMClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout)
+        else:
+            model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout)
+    elif arch == "mlp":
+        backbone = TabularMLPBackbone(
+            numerical_input_size=len(bundle.numerical_feature_columns),
+            embedding_settings=bundle.embedding_settings,
+            hidden_size=hidden_size,
+            dropout=dropout,
+        )
+        if model_type == "classifier":
+            model = TabularClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout)
+        else:
+            model = TabularRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout)
+    elif arch == "siamese":
+        backbone = SiameseLSTMBackbone(
+            numerical_input_size=len(bundle.numerical_feature_columns),
+            embedding_settings=bundle.embedding_settings,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        if model_type == "classifier":
+            model = SiameseClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout)
+        else:
+            model = SiameseRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout)
+    else:
+        raise ValueError(f"arch deve ser 'legacy', 'mlp' ou 'siamese', não '{arch}'")
+
+    return model.to(runtime_device)
+
+
+def _universal_forward_pass(arch: str, model: nn.Module, batch: tuple, device: torch.device):
+    """
+    Desempacota o batch de acordo com a arquitetura e realiza o forward pass.
+    Retorna: (outputs, class_targets, regression_targets)
+    """
+    if arch == "siamese":
+        inputs, c_targs, r_targs = batch
+        h_num, h_cat, a_num, a_cat, m_num, m_cat = inputs
+        outputs = model(
+            h_num.to(device), h_cat.to(device), a_num.to(device), a_cat.to(device),
+            m_num.to(device), m_cat.to(device)
+        )
+        return outputs, c_targs.to(device), r_targs.to(device)
+
+    num, cat, c_targs, r_targs = batch
+    outputs = model(num.to(device), cat.to(device))
+    return outputs, c_targs.to(device), r_targs.to(device)
 
 
 def _format_eta(seconds: float) -> str:
@@ -151,8 +227,10 @@ def _render_progress(epoch: int, epochs: int, step: int, total_steps: int, loss:
 
 def _collect_validation_predictions(
     model: nn.Module,
+    arch: str,
     model_type: str,
     validation_dataframe,
+    validation_loader: torch.utils.data.DataLoader | None,
     numerical_feature_columns: list[str],
     categorical_feature_columns: list[str],
     sequence_length: int,
@@ -168,44 +246,85 @@ def _collect_validation_predictions(
         predicted_frame["pred_gols_visitante"] = np.nan
 
     model.eval()
-    numerical_batches: list[torch.Tensor] = []
-    categorical_batches: list[torch.Tensor] = []
-    row_positions: list[int] = []
+    if arch == "legacy":
+        numerical_batches: list[torch.Tensor] = []
+        categorical_batches: list[torch.Tensor] = []
+        row_positions: list[int] = []
 
-    ordered = validation_dataframe.sort_values([YEAR_COLUMN])
-    for _, season_frame in ordered.groupby(YEAR_COLUMN, sort=True):
-        season_frame = season_frame.reset_index()
-        if len(season_frame) < sequence_length:
-            continue
+        ordered = validation_dataframe.sort_values([YEAR_COLUMN])
+        for _, season_frame in ordered.groupby(YEAR_COLUMN, sort=True):
+            season_frame = season_frame.reset_index()
+            if len(season_frame) < sequence_length:
+                continue
 
-        numerical_features = torch.tensor(season_frame[numerical_feature_columns].to_numpy(), dtype=torch.float32)
-        categorical_features = torch.tensor(season_frame[categorical_feature_columns].to_numpy(), dtype=torch.int64)
-        for end_index in range(sequence_length - 1, len(season_frame)):
-            start_index = end_index - sequence_length + 1
-            numerical_batches.append(numerical_features[start_index : end_index + 1])
-            categorical_batches.append(categorical_features[start_index : end_index + 1])
-            row_positions.append(int(season_frame.loc[end_index, "index"]))
+            numerical_features = torch.tensor(season_frame[numerical_feature_columns].to_numpy(), dtype=torch.float32)
+            categorical_features = torch.tensor(season_frame[categorical_feature_columns].to_numpy(), dtype=torch.int64)
+            for end_index in range(sequence_length - 1, len(season_frame)):
+                start_index = end_index - sequence_length + 1
+                numerical_batches.append(numerical_features[start_index : end_index + 1])
+                categorical_batches.append(categorical_features[start_index : end_index + 1])
+                row_positions.append(int(season_frame.loc[end_index, "index"]))
 
-    if not numerical_batches:
+        if not numerical_batches:
+            return predicted_frame
+
+        numerical_batch_tensor = torch.stack(numerical_batches).to(device)
+        categorical_batch_tensor = torch.stack(categorical_batches).to(device)
+        with torch.no_grad():
+            outputs = model(numerical_batch_tensor, categorical_batch_tensor)
+            if model_type == "classifier":
+                predicted_classes = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
+                predicted_goals = np.full((len(predicted_classes), 2), np.nan)
+            else:
+                predicted_goals = torch.exp(outputs).cpu().numpy()
+                predicted_classes = np.full((len(predicted_goals), 3), np.nan)
+
+        for row_position, predicted_class, (predicted_home_goals, predicted_away_goals) in zip(row_positions, predicted_classes, predicted_goals):
+            if model_type == "classifier":
+                predicted_frame.loc[row_position, "pred_resultado_empate"] = predicted_class[0]
+                predicted_frame.loc[row_position, "pred_resultado_vitoria_mandante"] = predicted_class[1]
+                predicted_frame.loc[row_position, "pred_resultado_vitoria_visitante"] = predicted_class[2]
+            else:
+                predicted_frame.loc[row_position, "pred_gols_mandante"] = float(predicted_home_goals)
+                predicted_frame.loc[row_position, "pred_gols_visitante"] = float(predicted_away_goals)
+
         return predicted_frame
 
-    numerical_batch_tensor = torch.stack(numerical_batches).to(device)
-    categorical_batch_tensor = torch.stack(categorical_batches).to(device)
-    with torch.no_grad():
-        outputs = model(numerical_batch_tensor, categorical_batch_tensor)
-        if model_type == "classifier":
-            predicted_classes = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
-            predicted_goals = np.full((len(predicted_classes), 2), np.nan)
-        else:
-            predicted_goals = torch.exp(outputs).cpu().numpy()
-            predicted_classes = np.full((len(predicted_goals), 3), np.nan)
+    predicted_frame = validation_dataframe.reset_index(drop=True).copy()
+    if model_type == "classifier":
+        predicted_frame["pred_resultado_empate"] = np.nan
+        predicted_frame["pred_resultado_vitoria_mandante"] = np.nan
+        predicted_frame["pred_resultado_vitoria_visitante"] = np.nan
+    else:
+        predicted_frame["pred_gols_mandante"] = np.nan
+        predicted_frame["pred_gols_visitante"] = np.nan
 
-    for row_position, predicted_class, (predicted_home_goals, predicted_away_goals) in zip(row_positions, predicted_classes, predicted_goals):
-        if model_type == "classifier":
+    if arch == "legacy":
+        raise ValueError("legacy validation predictions are handled earlier in this function")
+
+    if validation_loader is None:
+        raise ValueError("validation_loader is required for non-legacy validation predictions")
+
+    class_predictions: list[np.ndarray] = []
+    goal_predictions: list[np.ndarray] = []
+
+    with torch.no_grad():
+        for batch in validation_loader:
+            outputs, _, _ = _universal_forward_pass(arch, model, batch, device)
+            if model_type == "classifier":
+                class_predictions.append(torch.softmax(outputs, dim=1).cpu().numpy())
+            else:
+                goal_predictions.append(torch.exp(outputs).cpu().numpy())
+
+    if model_type == "classifier":
+        predicted_classes = np.concatenate(class_predictions, axis=0) if class_predictions else np.empty((0, 3))
+        for row_position, predicted_class in enumerate(predicted_classes):
             predicted_frame.loc[row_position, "pred_resultado_empate"] = predicted_class[0]
             predicted_frame.loc[row_position, "pred_resultado_vitoria_mandante"] = predicted_class[1]
             predicted_frame.loc[row_position, "pred_resultado_vitoria_visitante"] = predicted_class[2]
-        else:
+    else:
+        predicted_goals = np.concatenate(goal_predictions, axis=0) if goal_predictions else np.empty((0, 2))
+        for row_position, (predicted_home_goals, predicted_away_goals) in enumerate(predicted_goals):
             predicted_frame.loc[row_position, "pred_gols_mandante"] = float(predicted_home_goals)
             predicted_frame.loc[row_position, "pred_gols_visitante"] = float(predicted_away_goals)
 
@@ -214,6 +333,7 @@ def _collect_validation_predictions(
 
 def _compute_epoch_metrics(
     model: nn.Module,
+    arch: str,
     model_type: str,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
@@ -233,9 +353,8 @@ def _compute_epoch_metrics(
 
     with torch.no_grad():
         for batch in loader:
-            sequences, categorical_sequences, class_targets, regression_targets = _move_batch(batch, device)
-            outputs = model(sequences, categorical_sequences)
-            batch_size = sequences.size(0)
+            outputs, class_targets, regression_targets = _universal_forward_pass(arch, model, batch, device)
+            batch_size = class_targets.size(0)
 
             if model_type == "classifier":
                 loss = criterion(outputs, class_targets)
@@ -286,6 +405,7 @@ def _compute_epoch_metrics(
 
 def train_model(
     csv_path: str | Path = Path(__file__).resolve().parents[1] / "data" / "dataset_scaled.csv",
+    arch: str = "mlp",
     model_type: str = "classifier",
     sequence_length: int = 10,
     batch_size: int = 64,
@@ -302,6 +422,8 @@ def train_model(
     validation_predictions_path: str | Path = Path(__file__).resolve().parents[0] / "respostas_lstm.csv",
 ) -> dict[str, Any]:
     
+    if arch not in ("legacy", "mlp", "siamese"):
+        raise ValueError(f"arch deve ser 'legacy', 'mlp' ou 'siamese', não '{arch}'")
     if model_type not in ("classifier", "regressor"):
         raise ValueError(f"model_type deve ser 'classifier' ou 'regressor', não '{model_type}'")
 
@@ -311,25 +433,24 @@ def train_model(
         sequence_length=sequence_length,
         batch_size=batch_size,
         num_workers=num_workers,
+        arch=arch,
     )
     runtime_device = get_device(device)
 
-    backbone = LSTMBackbone(
-        numerical_input_size=len(bundle.numerical_feature_columns),
-        embedding_settings=bundle.embedding_settings,
+    pesos_classes = [1.248, 0.6, 1.3]
+    model = _build_model(
+        arch=arch,
+        model_type=model_type,
+        bundle=bundle,
         hidden_size=hidden_size,
         num_layers=num_layers,
         dropout=dropout,
-    ).to(runtime_device)
-
-    pesos_classes = [1.248, 0.6, 1.3]
+        runtime_device=runtime_device,
+    )
     if model_type == "classifier":
-        model = LSTMClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
         criterion = FocalLoss(alpha=pesos_classes, gamma=2.0, reduction='mean')
-        #nn.CrossEntropyLoss(weight=torch.tensor([1.3, 0.7, 1.4], device=runtime_device), label_smoothing=0.4)  # Pesos iguais para as classes
     else:
-        model = LSTMRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout).to(runtime_device)
-        criterion = nn.PoissonNLLLoss(log_input=False) #nn.SmoothL1Loss(beta=2)
+        criterion = nn.PoissonNLLLoss(log_input=False)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.7, min_lr=1e-6, cooldown=5)
@@ -362,11 +483,10 @@ def train_model(
         total_steps = len(bundle.train_loader)
 
         for step, batch in enumerate(bundle.train_loader, start=1):
-            sequences, categorical_sequences, class_targets, regression_targets = _move_batch(batch, runtime_device)
             optimizer.zero_grad(set_to_none=False)
 
             with torch.cuda.amp.autocast(enabled=use_amp):
-                outputs = model(sequences, categorical_sequences)
+                outputs, class_targets, regression_targets = _universal_forward_pass(arch, model, batch, runtime_device)
                 if model_type == "classifier":
                     loss = criterion(outputs, class_targets)
                     classification_loss = loss
@@ -381,7 +501,7 @@ def train_model(
             scaler.step(optimizer)
             scaler.update()
 
-            batch_size_actual = sequences.size(0)
+            batch_size_actual = class_targets.size(0)
             running_samples += batch_size_actual
             running_loss += float(loss.item()) * batch_size_actual
             running_classification_loss += float(classification_loss.item()) * batch_size_actual
@@ -429,6 +549,7 @@ def train_model(
 
         validation_metrics = _compute_epoch_metrics(
             model=model,
+            arch=arch,
             model_type=model_type,
             loader=bundle.validation_loader,
             device=runtime_device,
@@ -436,11 +557,12 @@ def train_model(
         )
 
         test_metrics = _compute_epoch_metrics(
-        model=model,
-        model_type=model_type,
-        loader=bundle.test_loader,
-        device=runtime_device,
-        criterion=criterion,
+            model=model,
+            arch=arch,
+            model_type=model_type,
+            loader=bundle.test_loader,
+            device=runtime_device,
+            criterion=criterion,
         )
 
         if model_type == "classifier":
@@ -517,8 +639,10 @@ def train_model(
     validation_predictions_path.parent.mkdir(parents=True, exist_ok=True)
     validation_predictions = _collect_validation_predictions(
         model=model,
+        arch=arch,
         model_type=model_type,
         validation_dataframe=validation_dataframe,
+        validation_loader=bundle.validation_loader,
         numerical_feature_columns=bundle.numerical_feature_columns,
         categorical_feature_columns=bundle.categorical_feature_columns,
         sequence_length=sequence_length,
@@ -528,6 +652,7 @@ def train_model(
 
     test_metrics = _compute_epoch_metrics(
         model=model,
+        arch=arch,
         model_type=model_type,
         loader=bundle.test_loader,
         device=runtime_device,
@@ -536,6 +661,7 @@ def train_model(
 
     validation_metrics = _compute_epoch_metrics(
         model=model,
+        arch=arch,
         model_type=model_type,
         loader=bundle.validation_loader,
         device=runtime_device,
@@ -631,13 +757,44 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 
 def main() -> None:
-    output = train_model(epochs=5000, sequence_length=64, batch_size=256, hidden_size=64,
-                         num_layers=2, dropout=0.25, learning_rate=1e-4, model_type="classifier",
-                         save_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_checkpoint.pth",
-                         best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / "lstm_best.pth",
-                         validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / "respostas_lstm.csv",
-                         early_stopping_patience=8, 
-                         csv_path=Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv")
+    parser = argparse.ArgumentParser(description="Train football predictor models across multiple architectures.")
+    parser.add_argument("--arch", choices=["legacy", "mlp", "siamese"], default="mlp")
+    parser.add_argument("--model_type", choices=["classifier", "regressor"], default="classifier")
+    parser.add_argument("--epochs", type=int, default=150)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--seq_len", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--hidden_size", type=int, default=64)
+    parser.add_argument("--num_layers", type=int, default=1)
+    parser.add_argument("--dropout", type=float, default=0.25)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--early_stopping_patience", type=int, default=2)
+    parser.add_argument(
+        "--csv_path",
+        type=str,
+        default=str(Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv"),
+    )
+    args = parser.parse_args()
+
+    results_name = f"respostas_{args.arch}.csv"
+    checkpoint_name = f"{args.arch}_{args.model_type}.pth"
+    output = train_model(
+        csv_path=Path(args.csv_path),
+        arch=args.arch,
+        model_type=args.model_type,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        sequence_length=args.seq_len,
+        hidden_size=args.hidden_size,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        learning_rate=args.lr,
+        num_workers=args.workers,
+        save_path=Path(__file__).resolve().parents[0] / "checkpoints" / checkpoint_name,
+        best_model_path=Path(__file__).resolve().parents[0] / "checkpoints" / f"best_{checkpoint_name}",
+        validation_predictions_path=Path(__file__).resolve().parents[0] / "results" / results_name,
+        early_stopping_patience=args.early_stopping_patience,
+    )
 
 
     print("Dispositivo:", output["device"])

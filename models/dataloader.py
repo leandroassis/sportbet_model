@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
@@ -134,6 +135,123 @@ class MatchSequenceDataset(Dataset):
         )
 
 
+class TabularMatchDataset(Dataset):
+    def __init__(
+        self,
+        numerical_dataframe: pd.DataFrame,
+        categorical_dataframe: pd.DataFrame,
+        numerical_feature_columns: list[str],
+        categorical_feature_columns: list[str],
+        sequence_length: int,
+    ) -> None:
+        del sequence_length
+        num_df_reset = numerical_dataframe.reset_index(drop=True)
+        cat_df_reset = categorical_dataframe[categorical_feature_columns].reset_index(drop=True)
+
+        self.numerical_features = torch.tensor(
+            num_df_reset[numerical_feature_columns].to_numpy(), dtype=torch.float32
+        )
+        self.categorical_features = torch.tensor(cat_df_reset.to_numpy(), dtype=torch.int64)
+        self.class_targets = torch.tensor(
+            num_df_reset[["resultado_empate", "resultado_vitoria_mandante", "resultado_vitoria_visitante"]].to_numpy(),
+            dtype=torch.float32,
+        )
+        self.regression_targets = torch.tensor(
+            num_df_reset[["gols_mandante", "gols_visitante"]].to_numpy(), dtype=torch.float32
+        )
+
+    def __len__(self) -> int:
+        return len(self.numerical_features)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            self.numerical_features[index],
+            self.categorical_features[index],
+            self.class_targets[index],
+            self.regression_targets[index],
+        )
+
+
+class SiameseMatchDataset(Dataset):
+    def __init__(
+        self,
+        numerical_dataframe: pd.DataFrame,
+        categorical_dataframe: pd.DataFrame,
+        numerical_feature_columns: list[str],
+        categorical_feature_columns: list[str],
+        sequence_length: int,
+    ) -> None:
+        self.sequence_length = sequence_length
+        num_df_reset = numerical_dataframe.reset_index(drop=True)
+        cat_df_reset = categorical_dataframe[categorical_feature_columns].reset_index(drop=True)
+        combined_df = pd.concat([num_df_reset, cat_df_reset], axis=1)
+
+        self.numerical_features = torch.tensor(
+            combined_df[numerical_feature_columns].to_numpy(), dtype=torch.float32
+        )
+        self.categorical_features = torch.tensor(
+            combined_df[categorical_feature_columns].to_numpy(), dtype=torch.int64
+        )
+        self.class_targets = torch.tensor(
+            combined_df[["resultado_empate", "resultado_vitoria_mandante", "resultado_vitoria_visitante"]].to_numpy(),
+            dtype=torch.float32,
+        )
+        self.regression_targets = torch.tensor(
+            combined_df[["gols_mandante", "gols_visitante"]].to_numpy(), dtype=torch.float32
+        )
+
+        self.home_team_col_idx = categorical_feature_columns.index("time_mandante")
+        self.away_team_col_idx = categorical_feature_columns.index("time_visitante")
+        self.team_history: dict[int, list[int]] = {}
+
+        for global_idx, row in cat_df_reset.iterrows():
+            global_index = cast(int, global_idx)
+            home_team_id = int(row["time_mandante"])
+            away_team_id = int(row["time_visitante"])
+            self.team_history.setdefault(home_team_id, []).append(global_index)
+            self.team_history.setdefault(away_team_id, []).append(global_index)
+
+    def _get_team_sequence(self, team_id: int, current_global_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        history = self.team_history.get(team_id, [])
+        past_indices = [idx for idx in history if idx < current_global_idx]
+        sequence_indices = past_indices[-self.sequence_length:]
+
+        numerical_sequence = [self.numerical_features[idx] for idx in sequence_indices]
+        categorical_sequence = [self.categorical_features[idx] for idx in sequence_indices]
+
+        pad_len = self.sequence_length - len(sequence_indices)
+        if pad_len > 0:
+            numerical_padding = torch.zeros((pad_len, self.numerical_features.shape[1]), dtype=torch.float32)
+            categorical_padding = torch.zeros((pad_len, self.categorical_features.shape[1]), dtype=torch.int64)
+            if numerical_sequence:
+                numerical_tensor = torch.cat([numerical_padding, torch.stack(numerical_sequence)], dim=0)
+                categorical_tensor = torch.cat([categorical_padding, torch.stack(categorical_sequence)], dim=0)
+            else:
+                numerical_tensor = numerical_padding
+                categorical_tensor = categorical_padding
+        else:
+            numerical_tensor = torch.stack(numerical_sequence)
+            categorical_tensor = torch.stack(categorical_sequence)
+
+        return numerical_tensor, categorical_tensor
+
+    def __len__(self) -> int:
+        return len(self.numerical_features)
+
+    def __getitem__(self, index: int) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+        match_num = self.numerical_features[index]
+        match_cat = self.categorical_features[index]
+        class_targets = self.class_targets[index]
+        regression_targets = self.regression_targets[index]
+
+        home_team_id = int(match_cat[self.home_team_col_idx].item())
+        away_team_id = int(match_cat[self.away_team_col_idx].item())
+        home_num, home_cat = self._get_team_sequence(home_team_id, index)
+        away_num, away_cat = self._get_team_sequence(away_team_id, index)
+
+        return ((home_num, home_cat, away_num, away_cat, match_num, match_cat), class_targets, regression_targets)
+
+
 def load_match_dataframe(csv_path: str | Path) -> pd.DataFrame:
     dataframe = pd.read_csv(csv_path)
 
@@ -226,19 +344,41 @@ def _build_loader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
-    is_train: bool = True
+    is_train: bool = True,
+    arch: str = "legacy",
 ) -> DataLoader:
 
-    dataset = MatchSequenceDataset(
-        numerical_dataframe=numerical_df,
-        categorical_dataframe=categorical_df,
-        numerical_feature_columns=numerical_feature_columns,
-        categorical_feature_columns=categorical_feature_columns,
-        sequence_length=sequence_length,
-    )
+    if arch == "mlp":
+        dataset = TabularMatchDataset(
+            numerical_dataframe=numerical_df,
+            categorical_dataframe=categorical_df,
+            numerical_feature_columns=numerical_feature_columns,
+            categorical_feature_columns=categorical_feature_columns,
+            sequence_length=sequence_length,
+        )
+    elif arch == "siamese":
+        dataset = SiameseMatchDataset(
+            numerical_dataframe=numerical_df,
+            categorical_dataframe=categorical_df,
+            numerical_feature_columns=numerical_feature_columns,
+            categorical_feature_columns=categorical_feature_columns,
+            sequence_length=sequence_length,
+        )
+    else:
+        dataset = MatchSequenceDataset(
+            numerical_dataframe=numerical_df,
+            categorical_dataframe=categorical_df,
+            numerical_feature_columns=numerical_feature_columns,
+            categorical_feature_columns=categorical_feature_columns,
+            sequence_length=sequence_length,
+        )
+
     if is_train:
         # Pega os targets (assumindo que class_targets é One-Hot)
-        targets = torch.stack([t for _, _, t, _ in dataset])
+        if arch == "siamese":
+            targets = torch.stack([item[1] for item in dataset])
+        else:
+            targets = torch.stack([item[2] for item in dataset])
         class_indices = torch.argmax(targets, dim=1)
         
         # Calcula o peso de cada amostra (inverso da frequência da classe)
@@ -248,7 +388,7 @@ def _build_loader(
         
         # Cria o sampler (ele fará o shuffle internamente baseado nos pesos)
         sampler = WeightedRandomSampler(
-            weights=sample_weights, 
+            weights=sample_weights.tolist(), 
             num_samples=len(sample_weights), 
             replacement=True
         )
@@ -263,6 +403,7 @@ def build_sequence_bundle(
     sequence_length: int = 8,
     batch_size: int = 64,
     num_workers: int = 0,
+    arch: str = "legacy",
 ) -> SequenceBundle:
     
     dataframe = load_match_dataframe(csv_path)
@@ -313,15 +454,15 @@ def build_sequence_bundle(
     # 7. Pass the correct dataframes to the loader builder
     train_loader = _build_loader(
         splits.train, train_categorical_features, numerical_feature_columns, categorical_feature_columns,
-        sequence_length, batch_size, shuffle=True, num_workers=num_workers, is_train=True
+        sequence_length, batch_size, shuffle=True, num_workers=num_workers, is_train=True, arch=arch
     )
     test_loader = _build_loader(
         splits.test, test_categorical_features, numerical_feature_columns, categorical_feature_columns,
-        sequence_length, batch_size, shuffle=False, num_workers=num_workers
+        sequence_length, batch_size, shuffle=False, num_workers=num_workers, arch=arch
     )
     validation_loader = _build_loader(
         splits.validation, validation_categorical_features, numerical_feature_columns, categorical_feature_columns,
-        sequence_length, batch_size, shuffle=False, num_workers=num_workers
+        sequence_length, batch_size, shuffle=False, num_workers=num_workers, arch=arch
     )
 
     # Calculate the final input size for the models
