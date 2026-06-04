@@ -31,6 +31,7 @@ try:
         load_match_dataframe,
         split_match_dataframe,
     )
+    from .financial_analyzer import FinancialAnalyzer
 except ImportError:  # pragma: no cover - fallback when run as a standalone script
     from dataloader import (
         FEATURE_COLUMNS,
@@ -44,6 +45,7 @@ except ImportError:  # pragma: no cover - fallback when run as a standalone scri
         load_match_dataframe,
         split_match_dataframe,
     )
+    from financial_analyzer import FinancialAnalyzer
 
 import torch
 import torch.nn as nn
@@ -437,7 +439,7 @@ def train_model(
     )
     runtime_device = get_device(device)
 
-    pesos_classes = [1.01, 1.03, 1.02]
+    pesos_classes = [1.25 ,0.67, 1.39] #[1.01, 1.03, 1.02]
     model = _build_model(
         arch=arch,
         model_type=model_type,
@@ -774,6 +776,24 @@ def main() -> None:
         type=str,
         default=str(Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv"),
     )
+    parser.add_argument(
+        "--financial_strategy",
+        choices=["flat", "ev"],
+        default="flat",
+        help="Estratégia de simulação financeira: flat (sempre aposta) ou ev (apenas +EV)"
+    )
+    parser.add_argument(
+        "--ev_threshold",
+        type=float,
+        default=0.0,
+        help="Limiar mínimo de EV para Value Betting (default: 0.0 = sem filtro)"
+    )
+    parser.add_argument(
+        "--betting_unit",
+        type=float,
+        default=1.0,
+        help="Valor da unidade de aposta (default: 1.0)"
+    )
     args = parser.parse_args()
     results_name = f"respostas_{args.arch}.csv"
     checkpoint_name = f"{args.arch}_{args.model_type}.pth"
@@ -799,11 +819,56 @@ def main() -> None:
     print("Dispositivo:", output["device"])
     print("Métricas de teste:", output["test_metrics"])
     print("Métricas de validação:", output["validation_metrics"])
-    print("Melhor época:", output["best_epoch"])   
-    
+    print("Melhor época:", output["best_epoch"])
+
     plots_dir = Path(__file__).resolve().parents[0] / "plots"
     plot_metrics(output, plots_dir)
     print(f"Gráficos salvos em: {plots_dir}")
+
+    # Run integrated financial analysis
+    print("\n" + "="*80)
+    print("INICIANDO ANÁLISE FINANCEIRA INTEGRADA")
+    print("="*80)
+    try:
+        device = torch.device(output["device"])
+
+        # Load original odds from raw CSV (antes de passar por scale_features)
+        original_dataframe = load_match_dataframe(Path(args.csv_path))
+        original_odds = original_dataframe[['AvgCH', 'AvgCD', 'AvgCA']].copy()
+
+        # Get validation dataframe with scaled features
+        validation_split = split_match_dataframe(original_dataframe)
+        validation_dataframe = validation_split.validation.copy()
+
+        # Replace scaled odds with original (real) odds
+        validation_dataframe['AvgCH'] = original_odds.loc[validation_dataframe.index, 'AvgCH']
+        validation_dataframe['AvgCD'] = original_odds.loc[validation_dataframe.index, 'AvgCD']
+        validation_dataframe['AvgCA'] = original_odds.loc[validation_dataframe.index, 'AvgCA']
+
+        # Initialize financial analyzer with validation data only
+        analyzer = FinancialAnalyzer(
+            validation_dataframe=validation_dataframe,
+            model=output["model"],
+            arch=args.arch,
+            model_type=args.model_type,
+            numerical_feature_columns=output["bundle"].numerical_feature_columns,
+            categorical_feature_columns=output["bundle"].categorical_feature_columns,
+            sequence_length=args.seq_len,
+            validation_loader=output["bundle"].validation_loader,
+            device=device,
+            output_dir=Path(__file__).resolve().parents[0],
+            financial_strategy=args.financial_strategy,
+            ev_threshold=args.ev_threshold,
+            betting_unit=args.betting_unit
+        )
+
+        financial_results = analyzer.run()
+        print("✓ Análise financeira concluída com sucesso!")
+
+    except Exception as e:
+        print(f"⚠️  Erro durante análise financeira: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
