@@ -9,7 +9,6 @@
 ## POSSIBILIDADES PARA MELHORAR O DATASET ##
 
 #1. Tentar usar apenas os dados da era dos pontos corridos (2006 em diante)
-2. Ao invés de prever H,D,A, tentar prever o número de gols de cada time (regressão) e depois converter isso para H,D,A;
 #3. Tentar prever um vetor 3d (vitoria do mandante, empate, vitória do visitante) ao invés de uma unica saida H, D, A;
 4. tentar melhorar preenchimento de NaN aonde ocorre com colunas de missing indicators para arbitro, estadio, tecnicos
 #5. tentar implementar sistema de ELO para os times
@@ -17,4 +16,4 @@
 ## POSSIBILIDADES PARA MELHORAR O MODELO ##
 
 1. Tentar unir as tarefas de classificacao e regressao
-2. tentar combinar o modelo LSTM com GNN para aproveitar a estrutura de grafo dos confrontos entre os times
+#2. tentar combinar o modelo LSTM com GNN para aproveitar a estrutura de grafo dos confrontos entre os times

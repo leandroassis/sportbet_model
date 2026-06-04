@@ -437,7 +437,7 @@ def train_model(
     )
     runtime_device = get_device(device)
 
-    pesos_classes = [1.248, 0.6, 1.3]
+    pesos_classes = [1.01, 1.03, 1.02]
     model = _build_model(
         arch=arch,
         model_type=model_type,
@@ -453,7 +453,7 @@ def train_model(
         criterion = nn.PoissonNLLLoss(log_input=False)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=3, factor=0.7, min_lr=1e-6, cooldown=5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5, cooldown=1)
     use_amp = runtime_device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
@@ -775,7 +775,6 @@ def main() -> None:
         default=str(Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv"),
     )
     args = parser.parse_args()
-
     results_name = f"respostas_{args.arch}.csv"
     checkpoint_name = f"{args.arch}_{args.model_type}.pth"
     output = train_model(
