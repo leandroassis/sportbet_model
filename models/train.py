@@ -439,7 +439,7 @@ def train_model(
     )
     runtime_device = get_device(device)
 
-    pesos_classes = [1.25 ,0.67, 1.39] #[1.01, 1.03, 1.02]
+    pesos_classes = [1, 1, 1] #[1.25 ,0.67, 1.39] #[1.01, 1.03, 1.02]
     model = _build_model(
         arch=arch,
         model_type=model_type,
@@ -794,6 +794,13 @@ def main() -> None:
         default=1.0,
         help="Valor da unidade de aposta (default: 1.0)"
     )
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=1.5,
+        help='Fator de Temperature Scaling (>1.0 reduz hiperconfiança)'
+    )
+
     args = parser.parse_args()
     results_name = f"respostas_{args.arch}.csv"
     checkpoint_name = f"{args.arch}_{args.model_type}.pth"
@@ -859,7 +866,8 @@ def main() -> None:
             output_dir=Path(__file__).resolve().parents[0],
             financial_strategy=args.financial_strategy,
             ev_threshold=args.ev_threshold,
-            betting_unit=args.betting_unit
+            betting_unit=args.betting_unit,
+            temperature=args.temperature,
         )
 
         financial_results = analyzer.run()

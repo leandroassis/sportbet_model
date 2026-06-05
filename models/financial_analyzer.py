@@ -24,6 +24,9 @@ warnings.filterwarnings('ignore')
 plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette('husl')
 
+import numpy as np
+from sklearn.metrics import classification_report
+
 
 @dataclass
 class BettingResult:
@@ -74,6 +77,7 @@ class FinancialAnalyzer:
         financial_strategy: str = "flat",
         ev_threshold: float = 0.0,
         betting_unit: float = 1.0,
+        temperature: float = 1.0
     ):
         """
         Inicializa o analisador financeiro.
@@ -106,6 +110,7 @@ class FinancialAnalyzer:
         self.financial_strategy = financial_strategy
         self.ev_threshold = ev_threshold
         self.betting_unit = betting_unit
+        self.temperature = temperature
 
         self.output_dir = Path(output_dir) if output_dir else Path(__file__).parent
         self.data_dir = self.output_dir / 'data'
@@ -174,6 +179,15 @@ class FinancialAnalyzer:
                         df_with_preds.loc[pred_idx:pred_idx+batch_actual_size-1, col] = probs[:, i]
 
                     pred_idx += batch_actual_size
+
+        if self.temperature != 1.0:
+            print(f"Calibrando probabilidades com Temperature Scaling (T={self.temperature})...")
+            probs_calibradas = aplicar_temperature_scaling(df_with_preds, self.PRED_COL_NAMES, temperature=self.temperature)
+
+            # Sobrescreve as colunas originais com as probabilidades calibradas
+            df_with_preds['pred_resultado_empate'] = probs_calibradas[:, 0]
+            df_with_preds['pred_resultado_vitoria_mandante'] = probs_calibradas[:, 1]
+            df_with_preds['pred_resultado_vitoria_visitante'] = probs_calibradas[:, 2]
 
         return df_with_preds
 
@@ -503,9 +517,16 @@ class FinancialAnalyzer:
         print("-"*80)
         print(f"\nBaseline (Odds do Mercado):")
         print(f"  Acurácia: {metrics_baseline.accuracy:.4f}")
+        print(f'\n{"Classe":<20} {"Precision":>10} {"Recall":>10} {"F1-Score":>10} {"Support":>10}')
+        for i, class_name in enumerate(self.CLASS_NAMES):
+            print(f"{class_name:<20} {metrics_baseline.precision[i]:>10.3f} {metrics_baseline.recall[i]:>10.3f} {metrics_baseline.f1[i]:>10.3f} {metrics_baseline.support[i]:>10d}")
+
         print(f"\nModelo Preditivo:")
         print(f"  Acurácia: {metrics_model.accuracy:.4f}")
         print(f"  Melhoria: {(metrics_model.accuracy - metrics_baseline.accuracy):+.4f}")
+        print(f'\n{"Classe":<20} {"Precision":>10} {"Recall":>10} {"F1-Score":>10} {"Support":>10}')
+        for i, class_name in enumerate(self.CLASS_NAMES):
+            print(f"{class_name:<20} {metrics_model.precision[i]:>10.3f} {metrics_model.recall[i]:>10.3f} {metrics_model.f1[i]:>10.3f} {metrics_model.support[i]:>10d}")
 
         print("\n" + "-"*80)
         print(f"SIMULAÇÃO FINANCEIRA ({self.financial_strategy.upper()} BETTING)")
@@ -521,3 +542,22 @@ class FinancialAnalyzer:
             print(f"  Yield/ROI: {result.yield_roi:+.2f}%")
 
         print("\n" + "="*80 + "\n")
+
+def aplicar_temperature_scaling(df, colunas_probs, temperature=1.5):
+    """
+    Aplica Temperature Scaling nas probabilidades pós-softmax.
+    Matematicamente: p_novo = p_original^(1/T) / sum(p_original^(1/T))
+    """
+    # Extrai a matriz de probabilidades atual
+    p = df[colunas_probs].values
+    
+    # Clip de segurança para evitar 0 absoluto antes da exponenciação
+    p = np.clip(p, 1e-7, 1.0 - 1e-7)
+    
+    # Aplica o fator de temperatura
+    p_scaled = np.power(p, 1.0 / temperature)
+    
+    # Re-normaliza para garantir que a soma das 3 classes feche em 100% (1.0)
+    p_calibrada = p_scaled / np.sum(p_scaled, axis=1, keepdims=True)
+    
+    return p_calibrada
