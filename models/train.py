@@ -100,6 +100,50 @@ class FocalLoss(nn.Module):
         
         return focal_loss
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class RPSLoss(nn.Module):
+    """
+    Ranked Probability Score (RPS) Loss para esportes.
+    Lida com o caráter ordinal do futebol, punindo erros extremos
+    (Prever Mandante e dar Visitante) mais do que erros adjacentes (Prever Mandante e dar Empate).
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, logits, targets):
+        # 1. Converte as saídas brutas da rede (logits) em probabilidades (0.0 a 1.0)
+        probs = F.softmax(logits, dim=1)
+        
+        # 2. Reorganiza a ordem dos tensores de [Empate, Mandante, Visitante] 
+        # para a ordem ordinal correta de campo: [Mandante, Empate, Visitante]
+        # Índices originais: Empate=0, Mandante=1, Visitante=2
+        ordinal_order = [1, 0, 2]
+        
+        probs_ordinal = probs[:, ordinal_order]
+        
+        # O target pode vir como índices ou One-Hot. Tratamos ambos:
+        if targets.ndim > 1 and targets.shape[1] == probs.shape[1]:
+            # Se for One-Hot encoding (como no seu DataLoader)
+            targets_ordinal = targets[:, ordinal_order]
+        else:
+            # Se for vetor de índices, convertemos para One-Hot e reordenamos
+            targets_one_hot = F.one_hot(targets.long(), num_classes=3).float()
+            targets_ordinal = targets_one_hot[:, ordinal_order]
+            
+        # 3. Calcula as Probabilidades Cumulativas (A mágica do RPS)
+        cum_probs = torch.cumsum(probs_ordinal, dim=1)
+        cum_targets = torch.cumsum(targets_ordinal, dim=1)
+        
+        # 4. Calcula o Erro Quadrático Médio entre as distribuições cumulativas
+        # Nós excluímos a última coluna (dim=-1) porque a soma cumulativa da última
+        # classe é sempre 1.0 para ambos (probs e targets), então a diferença é 0.
+        rps_score = torch.mean((cum_probs[:, :-1] - cum_targets[:, :-1]) ** 2, dim=1)
+        
+        # Retorna a média do erro RPS para todo o batch
+        return torch.mean(rps_score)
 
 @dataclass
 class EpochMetrics:
@@ -450,7 +494,8 @@ def train_model(
         runtime_device=runtime_device,
     )
     if model_type == "classifier":
-        criterion = FocalLoss(alpha=pesos_classes, gamma=2.0, reduction='mean')
+        #criterion = FocalLoss(alpha=pesos_classes, gamma=2.0, reduction='mean')
+	    criterion = RPSLoss()
     else:
         criterion = nn.PoissonNLLLoss(log_input=False)
 
