@@ -156,33 +156,78 @@ class FinancialAnalyzer:
 
         with torch.no_grad():
             for batch in self.validation_loader:
-                # O processamento deve ser idêntico ao do train.py (build_catboost_dataset)
-                (h_num, h_cat, a_num, a_cat, m_num, m_cat), _, _ = batch
-                
-                # Para hybrid, extraímos o embedding da Siamese
-                emb = self.model(
-                    h_num.to(self.device), h_cat.to(self.device),
-                    a_num.to(self.device), a_cat.to(self.device),
-                    m_num.to(self.device), m_cat.to(self.device)
-                )
-                
-                # Concatena m_num (Odds) com emb (128 dims) -> MESMA LÓGICA DO TREINO
-                full_features = torch.cat([m_num.to(self.device), emb], dim=-1)
-                all_outputs_list.append(full_features.cpu().numpy())
+                if self.arch in ['siamese', 'hybrid']:
+                    (h_num, h_cat, a_num, a_cat, m_num, m_cat), targets, _ = batch
+                    outputs = self.model(
+                        h_num.to(self.device), h_cat.to(self.device),
+                        a_num.to(self.device), a_cat.to(self.device),
+                        m_num.to(self.device), m_cat.to(self.device)
+                    )
+                    
+                    if self.arch == 'hybrid' and self.catboost_model is not None:
+                        emb_np = outputs.cpu().numpy()
+                        
+                        # INTELIGÊNCIA DINÂMICA: Verifica quantas colunas o CatBoost espera
+                        try:
+                            # Tenta ler a quantidade de features do modelo treinado
+                            expected_features = len(self.catboost_model.feature_names_)
+                        except Exception:
+                            expected_features = emb_np.shape[1]
+                            
+                        # Monta a matriz exatamente como foi feito no treino
+                        if expected_features > emb_np.shape[1]:
+                            # O modelo foi treinado com as Odds concatenadas (m_num + emb)
+                            m_num_np = m_num.cpu().numpy()
+                            full_features = np.hstack([m_num_np, emb_np])
+                            all_outputs_list.append(full_features)
+                        else:
+                            # O modelo foi treinado no 'Plano A' (Apenas Embeddings)
+                            all_outputs_list.append(emb_np)
+                    else:
+                        if self.model_type == 'classifier':
+                            probs = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
+                            all_outputs_list.append(probs)
+                else:
+                    numerical_feat, categorical_feat, targets, _ = batch
+                    outputs = self.model(numerical_feat.to(self.device), categorical_feat.to(self.device))
+                    
+                    if self.model_type == 'classifier':
+                        probs = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
+                        all_outputs_list.append(probs)
 
-        # Matriz final com todas as colunas alinhadas
         matrix_features = np.vstack(all_outputs_list)
 
         if self.arch == 'hybrid' and self.catboost_model is not None:
-            # Aqui passamos a matriz pronta, sem concatenar nada extra
+            print("Executando inferência combinada através do modelo CatBoost...")
             final_probabilities = self.catboost_model.predict_proba(matrix_features)
         else:
             final_probabilities = matrix_features
+
+        # ALINHAMENTO DE SEQUÊNCIA (Obrigatório para arquiteturas que usam warm-up de tempo)
+        if len(final_probabilities) < len(df_with_preds):
+            diff = len(df_with_preds) - len(final_probabilities)
+            print(f"⚠️ Alinhamento ativado: Removendo {diff} partidas de warm-up...")
+            try:
+                from dataloader import YEAR_COLUMN
+                valid_indices = []
+                ordered = df_with_preds.sort_values([YEAR_COLUMN])
+                for _, season_frame in ordered.groupby(YEAR_COLUMN, sort=True):
+                    if len(season_frame) < self.sequence_length:
+                        continue
+                    for end_index in range(self.sequence_length - 1, len(season_frame)):
+                        valid_indices.append(season_frame.index[end_index])
+                if len(valid_indices) == len(final_probabilities):
+                    df_with_preds = df_with_preds.loc[valid_indices].reset_index(drop=True)
+                else:
+                    df_with_preds = df_with_preds.iloc[diff:].reset_index(drop=True)
+            except ImportError:
+                df_with_preds = df_with_preds.iloc[diff:].reset_index(drop=True)
 
         for i, col in enumerate(self.PRED_COL_NAMES):
             df_with_preds[col] = final_probabilities[:, i]
 
         if self.temperature != 1.0:
+            print(f"Calibrando probabilidades com Temperature Scaling (T={self.temperature})...")
             probs_calibradas = aplicar_temperature_scaling(df_with_preds, self.PRED_COL_NAMES, temperature=self.temperature)
             df_with_preds['pred_resultado_empate'] = probs_calibradas[:, 0]
             df_with_preds['pred_resultado_vitoria_mandante'] = probs_calibradas[:, 1]
