@@ -356,7 +356,7 @@ def _build_loader(
             categorical_feature_columns=categorical_feature_columns,
             sequence_length=sequence_length,
         )
-    elif arch == "siamese":
+    elif arch in ["siamese", "hybrid"]:
         dataset = SiameseMatchDataset(
             numerical_dataframe=numerical_df,
             categorical_dataframe=categorical_df,
@@ -375,7 +375,7 @@ def _build_loader(
 
     if is_train:
         # Pega os targets (assumindo que class_targets é One-Hot)
-        if arch == "siamese":
+        if arch in ["siamese", "hybrid"]:
             targets = torch.stack([item[1] for item in dataset])
         else:
             targets = torch.stack([item[2] for item in dataset])

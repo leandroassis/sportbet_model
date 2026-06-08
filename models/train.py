@@ -171,6 +171,11 @@ try:
 except ImportError:
     from SiameseLSTM import SiameseLSTMBackbone, SiameseClassifier, SiameseRegressor
 
+try:
+    from .SiameseHybrid import SiameseHybridClassifier, SiameseEmbeddingExtractor
+except ImportError:
+    from SiameseHybrid import SiameseHybridClassifier, SiameseEmbeddingExtractor
+
 def get_device(device: str | None = None) -> torch.device:
     if device is not None:
         return torch.device(device)
@@ -221,6 +226,18 @@ def _build_model(
             model = SiameseClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout)
         else:
             model = SiameseRegressor(backbone=backbone, hidden_size=hidden_size, dropout=dropout)
+    elif arch == "hybrid":
+        backbone = SiameseLSTMBackbone(
+            numerical_input_size=len(bundle.numerical_feature_columns),
+            embedding_settings=bundle.embedding_settings,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        if model_type == "classifier":
+            model = SiameseHybridClassifier(backbone=backbone, hidden_size=hidden_size, dropout=dropout, numerical_input_size=len(bundle.numerical_feature_columns))
+        else:
+            raise NotImplementedError(f"'{arch}' não suporta regressão. tente model_type 'classifier'")
     else:
         raise ValueError(f"arch deve ser 'legacy', 'mlp' ou 'siamese', não '{arch}'")
 
@@ -232,7 +249,7 @@ def _universal_forward_pass(arch: str, model: nn.Module, batch: tuple, device: t
     Desempacota o batch de acordo com a arquitetura e realiza o forward pass.
     Retorna: (outputs, class_targets, regression_targets)
     """
-    if arch == "siamese":
+    if arch in ["siamese", "hybrid"]:
         inputs, c_targs, r_targs = batch
         h_num, h_cat, a_num, a_cat, m_num, m_cat = inputs
         outputs = model(
@@ -468,7 +485,7 @@ def train_model(
     validation_predictions_path: str | Path = Path(__file__).resolve().parents[0] / "respostas_lstm.csv",
 ) -> dict[str, Any]:
     
-    if arch not in ("legacy", "mlp", "siamese"):
+    if arch not in ("legacy", "mlp", "siamese", "hybrid"):
         raise ValueError(f"arch deve ser 'legacy', 'mlp' ou 'siamese', não '{arch}'")
     if model_type not in ("classifier", "regressor"):
         raise ValueError(f"model_type deve ser 'classifier' ou 'regressor', não '{model_type}'")
@@ -805,7 +822,7 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train football predictor models across multiple architectures.")
-    parser.add_argument("--arch", choices=["legacy", "mlp", "siamese"], default="mlp")
+    parser.add_argument("--arch", choices=["legacy", "mlp", "siamese", "hybrid"], default="mlp")
     parser.add_argument("--model_type", choices=["classifier", "regressor"], default="classifier")
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=128)

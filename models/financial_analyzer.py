@@ -160,7 +160,7 @@ class FinancialAnalyzer:
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.validation_loader):
-                if self.arch == 'siamese':
+                if self.arch in ['siamese', 'hybrid']:
                     (home_num, home_cat, away_num, away_cat, match_num, match_cat), targets, _ = batch
                     outputs = self.model(
                         home_num.to(self.device), home_cat.to(self.device),
