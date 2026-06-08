@@ -176,7 +176,7 @@ try:
 except ImportError:
     from SiameseHybrid import SiameseHybridClassifier, SiameseEmbeddingExtractor
 
-from catboost import CatBoost
+from catboost import CatBoostClassifier
 from SiameseHybrid import SiameseEmbeddingExtractor
 # Certifique-se de que load_match_dataframe está importado do dataloader
 from dataloader import load_match_dataframe
@@ -953,24 +953,24 @@ def main() -> None:
         
         # 2. Constrói as matrizes X e y chamando a função com TRÊS argumentos apenas!
         print("Extraindo features do Treino...")
-        X_train, y_train = build_catboost_dataset(output["bundle"].train_loader, extractor, device, one_hot_encoded=True)
+        X_train, y_train = build_catboost_dataset(output["bundle"].train_loader, extractor, device, one_hot_encoded=False)
         
         print("Extraindo features da Validação...")
-        X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, device, one_hot_encoded=True)
+        X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, device, one_hot_encoded=False)
         
         # 4. Treina o CatBoost
-        catboost_model_final = CatBoost({
-            'iterations': 3000,
-            'learning_rate': 0.01,
-            'depth': 3,
-            'loss_function': 'MultiClass',
-            'eval_metric': 'TotalF1',
-            'class_weights': [1.25, 0.75, 1.4],
-            'use_best_model': True,
-            'od_type': 'Iter',
-            'od_wait': 150,
-            'verbose': 2
-        })
+        catboost_model_final = CatBoostClassifier(
+            iterations=3000,
+            learning_rate=0.01,
+            depth=3,
+            loss_function='MultiCrossEntropy',
+            eval_metric='MultiCrossEntropy',
+            #'class_weights': [1.25, 0.75, 1.4],
+            use_best_model=True,
+            od_type='Iter',
+            od_wait=150,
+            verbose=2
+        )
         catboost_model_final.fit(X_train, y_train, eval_set=(X_val, y_val))
         print("Treinamento do CatBoost concluído!")
 

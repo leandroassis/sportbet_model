@@ -17,3 +17,9 @@
 
 1. Tentar unir as tarefas de classificacao e regressao
 #2. tentar combinar o modelo LSTM com GNN para aproveitar a estrutura de grafo dos confrontos entre os times
+
+
+## ENCERRAMENTO ##
+
+1. consertar avaliacao financeira para legacy, mlp e siamese
+2. decisao final de investimento sera um quorum de M modelos

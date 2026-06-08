@@ -175,7 +175,7 @@ class FinancialAnalyzer:
 
         if self.arch == 'hybrid' and self.catboost_model is not None:
             # Aqui passamos a matriz pronta, sem concatenar nada extra
-            final_probabilities = self.catboost_model.predict(matrix_features)
+            final_probabilities = self.catboost_model.predict_proba(matrix_features)
         else:
             final_probabilities = matrix_features
 
@@ -233,7 +233,7 @@ class FinancialAnalyzer:
             confusion_matrix=cm
         )
 
-    def simulate_flat_betting(self, df: pd.DataFrame, predictions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, float, int, int, float]:
+    def simulate_flat_betting(self, df: pd.DataFrame, predictions: np.ndarray, predictions_prob: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, float, float, int, int, float]:
         """Simula flat betting (sempre aposta)."""
         pl_series = np.zeros(len(df))
         ev_series = np.zeros(len(df))
@@ -252,8 +252,11 @@ class FinancialAnalyzer:
                 ev_series[idx] = 0.0
             else:
                 prob_col = self.PRED_COL_NAMES[classe_predita]
-                prob_predita = df.iloc[idx][prob_col]
-                
+                if self.catboost_model is None or predictions_prob is None:
+                    prob_predita = df.iloc[idx][prob_col]
+                else:
+                    prob_predita = predictions_prob[idx][classe_predita]
+
                 # Cálculo do EV real: (Probabilidade do Modelo * Odd) - 1
                 ev_series[idx] = (prob_predita * odd_aposta) - 1.0
 
@@ -273,7 +276,7 @@ class FinancialAnalyzer:
         return pl_series, cumsum_pl, final_balance, avg_ev, bets_placed, bets_won, yield_roi
 
 
-    def simulate_value_betting(self, df: pd.DataFrame, predictions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, float, int, int, float]:
+    def simulate_value_betting(self, df: pd.DataFrame, predictions: np.ndarray, predictions_prob: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, float, float, int, int, float]:
         """Simula value betting: aposta apenas quando EV > threshold."""
         pl_series = np.zeros(len(df))
         ev_apostas_realizadas = []
@@ -293,7 +296,10 @@ class FinancialAnalyzer:
                 pl_series[idx] = 0.0
             else:
                 prob_col = self.PRED_COL_NAMES[classe_predita]
-                prob_predita = df.iloc[idx][prob_col]
+                if self.catboost_model is None or predictions_prob is None:
+                    prob_predita = df.iloc[idx][prob_col]
+                else:
+                    prob_predita = predictions_prob[idx][classe_predita]
 
                 # EV Matemático
                 ev = (prob_predita * odd_aposta) - 1.0
@@ -440,6 +446,7 @@ class FinancialAnalyzer:
         # Modelo
         print("Calculando estratégia do Modelo...")
         model_pred = np.argmax(df_predictions[self.PRED_COL_NAMES].values, axis=1)
+        model_probs = df_predictions[self.PRED_COL_NAMES].values
 
         # Métricas
         print("Computando métricas...")
@@ -452,11 +459,11 @@ class FinancialAnalyzer:
         if self.financial_strategy == 'flat':
             # Flat Betting: ambos sempre apostam
             pl_base, cumsum_base, final_base, ev_base, bets_base, wins_base, yield_base = self.simulate_flat_betting(df_predictions, baseline_pred)
-            pl_model, cumsum_model, final_model, ev_model, bets_model, wins_model, yield_model = self.simulate_flat_betting(df_predictions, model_pred)
+            pl_model, cumsum_model, final_model, ev_model, bets_model, wins_model, yield_model = self.simulate_flat_betting(df_predictions, model_pred, predictions_prob=model_probs)
         else:
             # Value Betting: Baseline sempre aposta, Modelo apenas +EV
             pl_base, cumsum_base, final_base, ev_base, bets_base, wins_base, yield_base = self.simulate_flat_betting(df_predictions, baseline_pred)
-            pl_model, cumsum_model, final_model, ev_model, bets_model, wins_model, yield_model = self.simulate_value_betting(df_predictions, model_pred)
+            pl_model, cumsum_model, final_model, ev_model, bets_model, wins_model, yield_model = self.simulate_value_betting(df_predictions, model_pred, predictions_prob=model_probs)
 
         results = {
             'Baseline': BettingResult(
