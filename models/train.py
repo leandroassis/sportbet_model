@@ -176,6 +176,11 @@ try:
 except ImportError:
     from SiameseHybrid import SiameseHybridClassifier, SiameseEmbeddingExtractor
 
+from catboost import CatBoostClassifier
+from SiameseHybrid import SiameseEmbeddingExtractor
+# Certifique-se de que load_match_dataframe está importado do dataloader
+from dataloader import load_match_dataframe
+
 def get_device(device: str | None = None) -> torch.device:
     if device is not None:
         return torch.device(device)
@@ -819,6 +824,42 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
     plt.savefig(save_dir / "f1_score_curve.png")
     plt.close()
 
+def build_catboost_dataset(dataloader, extractor_model, df_split, device):
+    """
+    Roda o DataLoader pela rede Siamese para gerar os Embeddings e 
+    concatena com as Odds originais do dataframe particionado para treinar o CatBoost.
+    """
+    extractor_model.eval()
+    X_emb_list, y_list = [], []
+    
+    # IMPORTANTE: shuffle=False garante que o DataLoader itere na mesma ordem exata do df_split
+    temp_loader = torch.utils.data.DataLoader(
+        dataloader.dataset, batch_size=dataloader.batch_size, shuffle=False
+    )
+    
+    with torch.no_grad():
+        for batch in temp_loader:
+            (h_num, h_cat, a_num, a_cat, m_num, m_cat), targets, _ = batch
+            emb = extractor_model(
+                h_num.to(device), h_cat.to(device), a_num.to(device), a_cat.to(device),
+                m_num.to(device), m_cat.to(device)
+            )
+            X_emb_list.append(emb.cpu().numpy())
+            
+            if targets.ndim > 1:
+                targets = torch.argmax(targets, dim=1)
+            y_list.append(targets.cpu().numpy())
+            
+    X_emb = np.vstack(X_emb_list)
+    y = np.concatenate(y_list)
+    
+    # Puxa as Odds diretamente do DataFrame correspondente ao split (já na ordem correta)
+    # Ordem: 0=Empate, 1=Mandante, 2=Visitante
+    odds_array = df_split[['AvgCD', 'AvgCH', 'AvgCA']].values
+    
+    # Concatena [Odds(3) + Embeddings(128)]
+    X_final = np.hstack((odds_array, X_emb))
+    return X_final, y
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train football predictor models across multiple architectures.")
@@ -893,6 +934,49 @@ def main() -> None:
     plots_dir = Path(__file__).resolve().parents[0] / "plots"
     plot_metrics(output, plots_dir)
     print(f"Gráficos salvos em: {plots_dir}")
+
+    print("Iniciando preparação para análise financeira...")
+    df_full = load_match_dataframe(args.csv_path) # Necessário para pegar as odds limpas
+    device = output["device"]
+    
+    catboost_model_final = None
+    pytorch_model_final = output["model"]
+
+    # SE A ARQUITETURA FOR HÍBRIDA: Treina o CatBoost agora!
+    if args.arch == 'hybrid':
+        print("\n" + "="*50)
+        print("TREINANDO CATBOOST COM EMBEDDINGS (ABORDAGEM 2)")
+        print("="*50)
+        
+        # 1. Recuperamos os DataFrames exatos de cada split para alinhamento das Odds
+        splits = split_match_dataframe(df_full)
+        
+        # 2. Congela a rede PyTorch e converte num extrator
+        extractor = SiameseEmbeddingExtractor(output["model"].backbone).to(device)
+        pytorch_model_final = extractor # O Analyzer usará o extrator para gerar a inferência
+        
+        # 3. Constrói as matrizes X e y para o CatBoost usando o DF exato de Treino e Validação
+        print("Extraindo features do Treino...")
+        X_train, y_train = build_catboost_dataset(output["bundle"].train_loader, extractor, splits.train, device)
+        
+        print("Extraindo features da Validação...")
+        X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, splits.validation, device)
+        
+        # 4. Treina o CatBoost
+        catboost_model_final = CatBoostClassifier(
+            iterations=1500,
+            learning_rate=0.03,
+            depth=2,
+            loss_function='MultiClass',
+            eval_metric='Accuracy',
+            class_weights=[1.248, 0.6751, 1.393],
+            use_best_model=True,
+            od_type='Iter',
+            od_wait=34,
+            verbose=1
+        )
+        catboost_model_final.fit(X_train, y_train, eval_set=(X_val, y_val))
+        print("Treinamento do CatBoost concluído!")
 
     # Run integrated financial analysis
     print("\n" + "="*80)
