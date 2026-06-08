@@ -243,31 +243,35 @@ class FinancialAnalyzer:
         for idx in range(len(df)):
             classe_predita = predictions[idx]
             odd_coluna = self.ODDS_COLS[classe_predita]
-            implied_prob = df.iloc[idx].get(odd_coluna, np.nan)
+            
+            # A coluna no DataFrame já é a Odd Decimal real (ex: 1.85, 3.20)
+            odd_aposta = df.iloc[idx].get(odd_coluna, np.nan)
 
-            if np.isnan(implied_prob):
+            if np.isnan(odd_aposta) or odd_aposta <= 1.0:
                 pl_series[idx] = 0.0
                 ev_series[idx] = 0.0
             else:
-                odd_aposta = 1.0 / implied_prob
                 prob_col = self.PRED_COL_NAMES[classe_predita]
                 prob_predita = df.iloc[idx][prob_col]
+                
+                # Cálculo do EV real: (Probabilidade do Modelo * Odd) - 1
+                ev_series[idx] = (prob_predita * odd_aposta) - 1.0
 
+                # Cálculo de P&L real
                 if classe_predita == classe_real[idx]:
                     pl_series[idx] = self.betting_unit * (odd_aposta - 1.0)
                 else:
                     pl_series[idx] = -self.betting_unit
-
-                ev_series[idx] = (prob_predita * odd_aposta) - 1.0
 
         cumsum_pl = np.cumsum(pl_series)
         final_balance = cumsum_pl[-1] if len(cumsum_pl) > 0 else 0.0
         avg_ev = np.mean(ev_series[~np.isnan(ev_series)])
         bets_placed = len(df)
         bets_won = np.sum(predictions == classe_real)
-        yield_roi = (final_balance / bets_placed / self.betting_unit * 100) if bets_placed > 0 else 0.0
+        yield_roi = (final_balance / (bets_placed * self.betting_unit) * 100) if bets_placed > 0 else 0.0
 
         return pl_series, cumsum_pl, final_balance, avg_ev, bets_placed, bets_won, yield_roi
+
 
     def simulate_value_betting(self, df: pd.DataFrame, predictions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, float, int, int, float]:
         """Simula value betting: aposta apenas quando EV > threshold."""
@@ -281,17 +285,19 @@ class FinancialAnalyzer:
         for idx in range(len(df)):
             classe_predita = predictions[idx]
             odd_coluna = self.ODDS_COLS[classe_predita]
-            implied_prob = df.iloc[idx].get(odd_coluna, np.nan)
-            prob_col = self.PRED_COL_NAMES[classe_predita]
-            prob_predita = df.iloc[idx][prob_col]
+            
+            # A coluna no DataFrame já é a Odd Decimal real
+            odd_aposta = df.iloc[idx].get(odd_coluna, np.nan)
 
-            if np.isnan(implied_prob):
+            if np.isnan(odd_aposta) or odd_aposta <= 1.0:
                 pl_series[idx] = 0.0
             else:
-                odd_aposta = 1.0 / implied_prob
+                prob_col = self.PRED_COL_NAMES[classe_predita]
+                prob_predita = df.iloc[idx][prob_col]
+
+                # EV Matemático
                 ev = (prob_predita * odd_aposta) - 1.0
 
-                # Se threshold <= 0, aposta em tudo (sem filtro). Caso contrário, filtra por EV
                 should_bet = (ev >= self.ev_threshold)
 
                 if should_bet:
