@@ -176,7 +176,7 @@ try:
 except ImportError:
     from SiameseHybrid import SiameseHybridClassifier, SiameseEmbeddingExtractor
 
-from catboost import CatBoostClassifier
+from catboost import CatBoost
 from SiameseHybrid import SiameseEmbeddingExtractor
 # Certifique-se de que load_match_dataframe está importado do dataloader
 from dataloader import load_match_dataframe
@@ -824,15 +824,16 @@ def plot_metrics(output: dict[str, Any], save_dir: Path) -> None:
     plt.savefig(save_dir / "f1_score_curve.png")
     plt.close()
 
-def build_catboost_dataset(dataloader, extractor_model, df_split, device):
+def build_catboost_dataset(dataloader, extractor_model, device, one_hot_encoded=False):
     """
     Roda o DataLoader pela rede Siamese para gerar os Embeddings e 
-    concatena com as Odds originais do dataframe particionado para treinar o CatBoost.
+    concatena NATIVAMENTE com as features numéricas da partida (m_num).
+    Garante que os alvos (targets) sejam índices 1D para o CatBoost.
     """
     extractor_model.eval()
-    X_emb_list, y_list = [], []
+    X_final_list, y_list = [], []
     
-    # IMPORTANTE: shuffle=False garante que o DataLoader itere na mesma ordem exata do df_split
+    # IMPORTANTE: shuffle=False para não perder a cronologia
     temp_loader = torch.utils.data.DataLoader(
         dataloader.dataset, batch_size=dataloader.batch_size, shuffle=False
     )
@@ -844,22 +845,17 @@ def build_catboost_dataset(dataloader, extractor_model, df_split, device):
                 h_num.to(device), h_cat.to(device), a_num.to(device), a_cat.to(device),
                 m_num.to(device), m_cat.to(device)
             )
-            X_emb_list.append(emb.cpu().numpy())
             
-            if targets.ndim > 1:
+            # Concatena as numéricas do jogo (que têm as Odds) com os Embeddings nativamente
+            x_batch = torch.cat([m_num.to(device), emb], dim=-1).cpu().numpy()
+            X_final_list.append(x_batch)
+            
+            # Força o Target a ser 1D (0, 1 ou 2) para a MultiClass
+            if targets.ndim > 1 and one_hot_encoded:
                 targets = torch.argmax(targets, dim=1)
             y_list.append(targets.cpu().numpy())
             
-    X_emb = np.vstack(X_emb_list)
-    y = np.concatenate(y_list)
-    
-    # Puxa as Odds diretamente do DataFrame correspondente ao split (já na ordem correta)
-    # Ordem: 0=Empate, 1=Mandante, 2=Visitante
-    odds_array = df_split[['AvgCD', 'AvgCH', 'AvgCA']].values
-    
-    # Concatena [Odds(3) + Embeddings(128)]
-    X_final = np.hstack((odds_array, X_emb))
-    return X_final, y
+    return np.vstack(X_final_list), np.concatenate(y_list)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train football predictor models across multiple architectures.")
@@ -955,26 +951,26 @@ def main() -> None:
         extractor = SiameseEmbeddingExtractor(output["model"].backbone).to(device)
         pytorch_model_final = extractor # O Analyzer usará o extrator para gerar a inferência
         
-        # 3. Constrói as matrizes X e y para o CatBoost usando o DF exato de Treino e Validação
+        # 2. Constrói as matrizes X e y chamando a função com TRÊS argumentos apenas!
         print("Extraindo features do Treino...")
-        X_train, y_train = build_catboost_dataset(output["bundle"].train_loader, extractor, splits.train, device)
+        X_train, y_train = build_catboost_dataset(output["bundle"].train_loader, extractor, device, one_hot_encoded=True)
         
         print("Extraindo features da Validação...")
-        X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, splits.validation, device)
+        X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, device, one_hot_encoded=True)
         
         # 4. Treina o CatBoost
-        catboost_model_final = CatBoostClassifier(
-            iterations=1500,
-            learning_rate=0.03,
-            depth=2,
-            loss_function='MultiClass',
-            eval_metric='Accuracy',
-            class_weights=[1.248, 0.6751, 1.393],
-            use_best_model=True,
-            od_type='Iter',
-            od_wait=34,
-            verbose=1
-        )
+        catboost_model_final = CatBoost({
+            'iterations': 3000,
+            'learning_rate': 0.01,
+            'depth': 3,
+            'loss_function': 'MultiClass',
+            'eval_metric': 'TotalF1',
+            'class_weights': [1.25, 0.75, 1.4],
+            'use_best_model': True,
+            'od_type': 'Iter',
+            'od_wait': 150,
+            'verbose': 2
+        })
         catboost_model_final.fit(X_train, y_train, eval_set=(X_val, y_val))
         print("Treinamento do CatBoost concluído!")
 
@@ -1001,7 +997,8 @@ def main() -> None:
         # Initialize financial analyzer with validation data only
         analyzer = FinancialAnalyzer(
             validation_dataframe=validation_dataframe,
-            model=output["model"],
+            model=pytorch_model_final,           # <-- PASSA O EXTRATOR
+            catboost_model=catboost_model_final, # <-- PASSA O CATBOOST
             arch=args.arch,
             model_type=args.model_type,
             numerical_feature_columns=output["bundle"].numerical_feature_columns,

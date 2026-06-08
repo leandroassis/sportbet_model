@@ -77,15 +77,16 @@ class FinancialAnalyzer:
         financial_strategy: str = "flat",
         ev_threshold: float = 0.0,
         betting_unit: float = 1.0,
-        temperature: float = 1.0
+        temperature: float = 1.0,
+        catboost_model = None
     ):
         """
         Inicializa o analisador financeiro.
 
         Args:
             validation_dataframe: DataFrame de validação com odds reais (não escaladas)
-            model: Modelo treinado (nn.Module)
-            arch: Arquitetura ('legacy', 'siamese', 'mlp')
+            model: Modelo treinado (nn.Module) ou Extrator de Embeddings PyTorch
+            arch: Arquitetura ('legacy', 'siamese', 'mlp', 'hybrid')
             model_type: Tipo de modelo ('classifier' ou 'regressor')
             numerical_feature_columns: Colunas numéricas do dataloader
             categorical_feature_columns: Colunas categóricas do dataloader
@@ -96,9 +97,12 @@ class FinancialAnalyzer:
             financial_strategy: 'flat' (sempre aposta) ou 'ev' (apenas +EV)
             ev_threshold: Limiar mínimo de EV para Value Betting
             betting_unit: Valor da unidade de aposta
+            temperature: Fator de Temperature Scaling para calibração
+            catboost_model: Instância do CatBoostClassifier ou CatBoostOrdinalWrapper treinado
         """
         self.validation_dataframe = validation_dataframe
         self.model = model
+        self.catboost_model = catboost_model
         self.arch = arch
         self.model_type = model_type
         self.numerical_feature_columns = numerical_feature_columns
@@ -142,49 +146,44 @@ class FinancialAnalyzer:
             print(f"✓ Threshold de EV: {self.ev_threshold:.4f}")
 
     def generate_predictions(self) -> pd.DataFrame:
-        """
-        Gera previsões do modelo em tempo real sobre os dados de validação.
-
-        Returns:
-            DataFrame com previsões integradas aos dados originais.
-        """
         df_with_preds = self.validation_dataframe.reset_index(drop=True).copy()
 
         for col in self.PRED_COL_NAMES:
             df_with_preds[col] = np.nan
 
         self.model.eval()
-
-        batch_size = self.validation_loader.batch_size
-        pred_idx = 0
+        all_outputs_list = []
 
         with torch.no_grad():
-            for batch_idx, batch in enumerate(self.validation_loader):
-                if self.arch in ['siamese', 'hybrid']:
-                    (home_num, home_cat, away_num, away_cat, match_num, match_cat), targets, _ = batch
-                    outputs = self.model(
-                        home_num.to(self.device), home_cat.to(self.device),
-                        away_num.to(self.device), away_cat.to(self.device),
-                        match_num.to(self.device), match_cat.to(self.device)
-                    )
-                else:
-                    numerical_feat, categorical_feat, targets, _ = batch
-                    outputs = self.model(numerical_feat.to(self.device), categorical_feat.to(self.device))
+            for batch in self.validation_loader:
+                # O processamento deve ser idêntico ao do train.py (build_catboost_dataset)
+                (h_num, h_cat, a_num, a_cat, m_num, m_cat), _, _ = batch
+                
+                # Para hybrid, extraímos o embedding da Siamese
+                emb = self.model(
+                    h_num.to(self.device), h_cat.to(self.device),
+                    a_num.to(self.device), a_cat.to(self.device),
+                    m_num.to(self.device), m_cat.to(self.device)
+                )
+                
+                # Concatena m_num (Odds) com emb (128 dims) -> MESMA LÓGICA DO TREINO
+                full_features = torch.cat([m_num.to(self.device), emb], dim=-1)
+                all_outputs_list.append(full_features.cpu().numpy())
 
-                if self.model_type == 'classifier':
-                    probs = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
-                    batch_actual_size = probs.shape[0]
+        # Matriz final com todas as colunas alinhadas
+        matrix_features = np.vstack(all_outputs_list)
 
-                    for i, col in enumerate(self.PRED_COL_NAMES):
-                        df_with_preds.loc[pred_idx:pred_idx+batch_actual_size-1, col] = probs[:, i]
+        if self.arch == 'hybrid' and self.catboost_model is not None:
+            # Aqui passamos a matriz pronta, sem concatenar nada extra
+            final_probabilities = self.catboost_model.predict(matrix_features)
+        else:
+            final_probabilities = matrix_features
 
-                    pred_idx += batch_actual_size
+        for i, col in enumerate(self.PRED_COL_NAMES):
+            df_with_preds[col] = final_probabilities[:, i]
 
         if self.temperature != 1.0:
-            print(f"Calibrando probabilidades com Temperature Scaling (T={self.temperature})...")
             probs_calibradas = aplicar_temperature_scaling(df_with_preds, self.PRED_COL_NAMES, temperature=self.temperature)
-
-            # Sobrescreve as colunas originais com as probabilidades calibradas
             df_with_preds['pred_resultado_empate'] = probs_calibradas[:, 0]
             df_with_preds['pred_resultado_vitoria_mandante'] = probs_calibradas[:, 1]
             df_with_preds['pred_resultado_vitoria_visitante'] = probs_calibradas[:, 2]

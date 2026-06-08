@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 from LSTM import TabularFeatureExtractor, TemporalAttention
 from SiameseLSTM import SiameseLSTMBackbone, SiameseClassifier, SiameseRegressor
 
@@ -54,3 +55,33 @@ class SiameseEmbeddingExtractor(nn.Module):
     def forward(self, h_num, h_cat, a_num, a_cat, m_num, m_cat) -> torch.Tensor:
         return self.backbone(h_num, h_cat, a_num, a_cat, m_num, m_cat)
 
+class CatBoostOrdinalWrapper:
+    """
+    Wrapper que encapsula dois modelos CatBoost binários para realizar 
+    Classificação Ordinal (Frank-Hall), otimizando diretamente o RPS.
+    Mantém a interface predict_proba para o FinancialAnalyzer.
+    """
+    def __init__(self, model_m1, model_m2):
+        self.model_m1 = model_m1
+        self.model_m2 = model_m2
+
+    def predict_proba(self, X):
+        # M1 prevê a probabilidade de ser Mandante
+        p1 = self.model_m1.predict_proba(X)[:, 1]
+        
+        # M2 prevê a probabilidade de ser Mandante ou Empate
+        p2 = self.model_m2.predict_proba(X)[:, 1]
+
+        # Garantia matemática de monotonicidade (P2 nunca pode ser menor que P1)
+        p1 = np.clip(p1, 0.0, 1.0)
+        p2 = np.maximum(p1, p2)
+        p2 = np.clip(p2, 0.0, 1.0)
+
+        # Reconstrução das 3 classes ordinais
+        prob_mandante = p1
+        prob_empate = p2 - p1
+        prob_visitante = 1.0 - p2
+
+        # Retorna na ordem exata que o FinancialAnalyzer exige: [Empate(0), Mandante(1), Visitante(2)]
+        probs = np.column_stack((prob_empate, prob_mandante, prob_visitante))
+        return probs
