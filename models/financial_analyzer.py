@@ -78,28 +78,9 @@ class FinancialAnalyzer:
         ev_threshold: float = 0.0,
         betting_unit: float = 1.0,
         temperature: float = 1.0,
-        catboost_model = None
+        catboost_model = None,
+        verbose: bool = True
     ):
-        """
-        Inicializa o analisador financeiro.
-
-        Args:
-            validation_dataframe: DataFrame de validação com odds reais (não escaladas)
-            model: Modelo treinado (nn.Module) ou Extrator de Embeddings PyTorch
-            arch: Arquitetura ('legacy', 'siamese', 'mlp', 'hybrid')
-            model_type: Tipo de modelo ('classifier' ou 'regressor')
-            numerical_feature_columns: Colunas numéricas do dataloader
-            categorical_feature_columns: Colunas categóricas do dataloader
-            sequence_length: Comprimento da sequência (para LSTM)
-            validation_loader: DataLoader de validação
-            device: Dispositivo PyTorch
-            output_dir: Diretório de saída (padrão: models/)
-            financial_strategy: 'flat' (sempre aposta) ou 'ev' (apenas +EV)
-            ev_threshold: Limiar mínimo de EV para Value Betting
-            betting_unit: Valor da unidade de aposta
-            temperature: Fator de Temperature Scaling para calibração
-            catboost_model: Instância do CatBoostClassifier ou CatBoostOrdinalWrapper treinado
-        """
         self.validation_dataframe = validation_dataframe
         self.model = model
         self.catboost_model = catboost_model
@@ -110,6 +91,7 @@ class FinancialAnalyzer:
         self.sequence_length = sequence_length
         self.validation_loader = validation_loader
         self.device = device
+        self.verbose = verbose
 
         self.financial_strategy = financial_strategy
         self.ev_threshold = ev_threshold
@@ -123,11 +105,11 @@ class FinancialAnalyzer:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
 
-        # Validar integridade das odds
+        self.df_predictions = None  # Inicialização de variável importante
+
         self._validate_odds_sanity()
 
     def _validate_odds_sanity(self) -> None:
-        """Valida que as odds estão em escala real (não normalizadas)."""
         odds_values = self.validation_dataframe[self.ODDS_COLS].values.flatten()
         odds_values = odds_values[~np.isnan(odds_values)]
 
@@ -140,10 +122,11 @@ class FinancialAnalyzer:
                 "Expected raw odds from validation dataframe, not scaled data."
             )
 
-        print(f"✓ Odds validation passed: mean={avg_odds:.4f}, min={min_odds:.4f}")
-        print(f"✓ Estratégia: {self.financial_strategy.upper()}")
-        if self.financial_strategy == "ev":
-            print(f"✓ Threshold de EV: {self.ev_threshold:.4f}")
+        if self.verbose:
+            print(f"✓ Odds validation passed: mean={avg_odds:.4f}, min={min_odds:.4f}")
+            print(f"✓ Estratégia: {self.financial_strategy.upper()}")
+            if self.financial_strategy == "ev":
+                print(f"✓ Threshold de EV: {self.ev_threshold:.4f}")
 
     def generate_predictions(self) -> pd.DataFrame:
         df_with_preds = self.validation_dataframe.reset_index(drop=True).copy()
@@ -166,22 +149,16 @@ class FinancialAnalyzer:
                     
                     if self.arch == 'hybrid' and self.catboost_model is not None:
                         emb_np = outputs.cpu().numpy()
-                        
-                        # INTELIGÊNCIA DINÂMICA: Verifica quantas colunas o CatBoost espera
                         try:
-                            # Tenta ler a quantidade de features do modelo treinado
                             expected_features = len(self.catboost_model.feature_names_)
                         except Exception:
                             expected_features = emb_np.shape[1]
                             
-                        # Monta a matriz exatamente como foi feito no treino
                         if expected_features > emb_np.shape[1]:
-                            # O modelo foi treinado com as Odds concatenadas (m_num + emb)
                             m_num_np = m_num.cpu().numpy()
                             full_features = np.hstack([m_num_np, emb_np])
                             all_outputs_list.append(full_features)
                         else:
-                            # O modelo foi treinado no 'Plano A' (Apenas Embeddings)
                             all_outputs_list.append(emb_np)
                     else:
                         if self.model_type == 'classifier':
@@ -190,7 +167,6 @@ class FinancialAnalyzer:
                 else:
                     numerical_feat, categorical_feat, targets, _ = batch
                     outputs = self.model(numerical_feat.to(self.device), categorical_feat.to(self.device))
-                    
                     if self.model_type == 'classifier':
                         probs = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
                         all_outputs_list.append(probs)
@@ -198,15 +174,14 @@ class FinancialAnalyzer:
         matrix_features = np.vstack(all_outputs_list)
 
         if self.arch == 'hybrid' and self.catboost_model is not None:
-            print("Executando inferência combinada através do modelo CatBoost...")
+            if self.verbose: print("Executando inferência combinada através do modelo CatBoost...")
             final_probabilities = self.catboost_model.predict_proba(matrix_features)
         else:
             final_probabilities = matrix_features
 
-        # ALINHAMENTO DE SEQUÊNCIA (Obrigatório para arquiteturas que usam warm-up de tempo)
         if len(final_probabilities) < len(df_with_preds):
             diff = len(df_with_preds) - len(final_probabilities)
-            print(f"⚠️ Alinhamento ativado: Removendo {diff} partidas de warm-up...")
+            if self.verbose: print(f"⚠️ Alinhamento ativado: Removendo {diff} partidas de warm-up...")
             try:
                 from dataloader import YEAR_COLUMN
                 valid_indices = []
@@ -227,7 +202,7 @@ class FinancialAnalyzer:
             df_with_preds[col] = final_probabilities[:, i]
 
         if self.temperature != 1.0:
-            print(f"Calibrando probabilidades com Temperature Scaling (T={self.temperature})...")
+            if self.verbose: print(f"Calibrando probabilidades com Temperature Scaling (T={self.temperature})...")
             probs_calibradas = aplicar_temperature_scaling(df_with_preds, self.PRED_COL_NAMES, temperature=self.temperature)
             df_with_preds['pred_resultado_empate'] = probs_calibradas[:, 0]
             df_with_preds['pred_resultado_vitoria_mandante'] = probs_calibradas[:, 1]
@@ -467,86 +442,58 @@ class FinancialAnalyzer:
         plt.close()
 
     def run(self) -> Dict[str, BettingResult]:
-        """
-        Executa análise completa com estratégia configurada.
-
-        Returns:
-            Dict com resultados financeiros (Baseline e Modelo)
-        """
-        print("\n" + "="*80)
-        print("ANÁLISE FINANCEIRA INTEGRADA")
-        print("="*80)
-
-        # Gerar predições
-        print("\nGerando predições do modelo...")
+        if self.verbose:
+            print("\n" + "="*80)
+            print("ANÁLISE FINANCEIRA INTEGRADA")
+            print("="*80)
+            print("\nGerando predições do modelo...")
+            
         df_predictions = self.generate_predictions()
-
-        # Extrair classe real
+        self.df_predictions = df_predictions  # GUARDA OS DADOS EXPORTÁVEIS
         df_predictions['classe_real'] = (df_predictions[self.TARGET_COLS].values @ np.array([0, 1, 2])).astype(int)
 
-        # Baseline (sempre aposta no menor odd)
-        print("Calculando estratégia Baseline...")
+        if self.verbose: print("Calculando estratégia Baseline...")
         baseline_pred = self.calculate_baseline_predictions(df_predictions)
 
-        # Modelo
-        print("Calculando estratégia do Modelo...")
+        if self.verbose: print("Calculando estratégia do Modelo...")
         model_pred = np.argmax(df_predictions[self.PRED_COL_NAMES].values, axis=1)
         model_probs = df_predictions[self.PRED_COL_NAMES].values
 
-        # Métricas
-        print("Computando métricas...")
+        if self.verbose: print("Computando métricas...")
         metrics_baseline = self.calculate_metrics(df_predictions['classe_real'].values, baseline_pred, 'Baseline (Odds)')
         metrics_model = self.calculate_metrics(df_predictions['classe_real'].values, model_pred, 'Modelo Preditivo')
 
-        # Simulação financeira
-        print(f"Simulando apostas ({self.financial_strategy.upper()})...")
-
+        if self.verbose: print(f"Simulando apostas ({self.financial_strategy.upper()})...")
         if self.financial_strategy == 'flat':
-            # Flat Betting: ambos sempre apostam
             pl_base, cumsum_base, final_base, ev_base, bets_base, wins_base, yield_base = self.simulate_flat_betting(df_predictions, baseline_pred)
             pl_model, cumsum_model, final_model, ev_model, bets_model, wins_model, yield_model = self.simulate_flat_betting(df_predictions, model_pred, predictions_prob=model_probs)
         else:
-            # Value Betting: Baseline sempre aposta, Modelo apenas +EV
             pl_base, cumsum_base, final_base, ev_base, bets_base, wins_base, yield_base = self.simulate_flat_betting(df_predictions, baseline_pred)
             pl_model, cumsum_model, final_model, ev_model, bets_model, wins_model, yield_model = self.simulate_value_betting(df_predictions, model_pred, predictions_prob=model_probs)
 
         results = {
             'Baseline': BettingResult(
-                strategy_name='Baseline',
-                predictions=baseline_pred,
-                pl_series=pl_base,
-                cumsum_pl=cumsum_base,
-                final_balance=final_base,
-                avg_ev=ev_base,
-                bets_placed=bets_base,
-                bets_won=wins_base,
-                yield_roi=yield_base
+                strategy_name='Baseline', predictions=baseline_pred, pl_series=pl_base,
+                cumsum_pl=cumsum_base, final_balance=final_base, avg_ev=ev_base,
+                bets_placed=bets_base, bets_won=wins_base, yield_roi=yield_base
             ),
             'Modelo': BettingResult(
-                strategy_name='Modelo',
-                predictions=model_pred,
-                pl_series=pl_model,
-                cumsum_pl=cumsum_model,
-                final_balance=final_model,
-                avg_ev=ev_model,
-                bets_placed=bets_model,
-                bets_won=wins_model,
-                yield_roi=yield_model
+                strategy_name='Modelo', predictions=model_pred, pl_series=pl_model,
+                cumsum_pl=cumsum_model, final_balance=final_model, avg_ev=ev_model,
+                bets_placed=bets_model, bets_won=wins_model, yield_roi=yield_model
             )
         }
 
-        # Gerar visualizações
-        print("Gerando visualizações...")
-        self.plot_confusion_matrix(metrics_baseline, metrics_model)
-        self.plot_financial_evolution(results)
+        if self.verbose:
+            print("Gerando visualizações...")
+            self.plot_confusion_matrix(metrics_baseline, metrics_model)
+            self.plot_financial_evolution(results)
 
-        # Salvar previsões
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        df_predictions.to_csv(self.data_dir / f'analise_financeira_{self.arch}.csv', index=False)
-        print(f"✓ Previsões salvas em data/analise_financeira_{self.arch}.csv")
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            df_predictions.to_csv(self.data_dir / f'analise_financeira_{self.arch}.csv', index=False)
+            print(f"✓ Previsões salvas em data/analise_financeira_{self.arch}.csv")
 
-        # Imprimir resumo
-        self._print_summary(df_predictions, metrics_baseline, metrics_model, results)
+            self._print_summary(df_predictions, metrics_baseline, metrics_model, results)
 
         return results
 

@@ -488,6 +488,7 @@ def train_model(
     save_path: str | Path | None = None,
     best_model_path: str | Path | None = None,
     validation_predictions_path: str | Path = Path(__file__).resolve().parents[0] / "respostas_lstm.csv",
+    verbose: bool = True,  # <-- NOVO PARÂMETRO
 ) -> dict[str, Any]:
     
     if arch not in ("legacy", "mlp", "siamese", "hybrid"):
@@ -505,7 +506,6 @@ def train_model(
     )
     runtime_device = get_device(device)
 
-    pesos_classes = [1, 1, 1] #[1.25 ,0.67, 1.39] #[1.01, 1.03, 1.02]
     model = _build_model(
         arch=arch,
         model_type=model_type,
@@ -516,8 +516,7 @@ def train_model(
         runtime_device=runtime_device,
     )
     if model_type == "classifier":
-        #criterion = FocalLoss(alpha=pesos_classes, gamma=2.0, reduction='mean')
-	    criterion = RPSLoss()
+        criterion = RPSLoss()
     else:
         criterion = nn.PoissonNLLLoss(log_input=False)
 
@@ -588,18 +587,20 @@ def train_model(
                     brier_error = ((probabilities - class_targets) ** 2).sum()
                     running_brier_score += float(brier_error.item())
 
-            _render_progress(
-                epoch=epoch,
-                epochs=epochs,
-                step=step,
-                total_steps=total_steps,
-                loss=running_loss / running_samples if running_samples else 0.0,
-                accuracy=running_correct / running_samples if running_samples and model_type == "classifier" else 0.0,
-                elapsed=time.time() - epoch_start,
-            )
+            if verbose:
+                _render_progress(
+                    epoch=epoch,
+                    epochs=epochs,
+                    step=step,
+                    total_steps=total_steps,
+                    loss=running_loss / running_samples if running_samples else 0.0,
+                    accuracy=running_correct / running_samples if running_samples and model_type == "classifier" else 0.0,
+                    elapsed=time.time() - epoch_start,
+                )
 
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        if verbose:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         train_f1_score = 0.0
         if model_type == "classifier" and running_samples > 0:
@@ -617,48 +618,39 @@ def train_model(
         )
 
         validation_metrics = _compute_epoch_metrics(
-            model=model,
-            arch=arch,
-            model_type=model_type,
-            loader=bundle.validation_loader,
-            device=runtime_device,
-            criterion=criterion,
+            model=model, arch=arch, model_type=model_type,
+            loader=bundle.validation_loader, device=runtime_device, criterion=criterion,
         )
 
         test_metrics = _compute_epoch_metrics(
-            model=model,
-            arch=arch,
-            model_type=model_type,
-            loader=bundle.test_loader,
-            device=runtime_device,
-            criterion=criterion,
+            model=model, arch=arch, model_type=model_type,
+            loader=bundle.test_loader, device=runtime_device, criterion=criterion,
         )
 
-        if model_type == "classifier":
-            summary_line = (
-                f"Epoch {epoch}/{epochs} final | "
-                f"train_class_loss={train_metrics.classification_loss:.6f} train_acc={train_metrics.accuracy:.6f} train_f1={train_metrics.f1_score:.6f} train_brier={train_metrics.brier_score:.6f} | "
-                f"test_acc={test_metrics.accuracy:.6f} test_f1={test_metrics.f1_score:.6f} test_brier={test_metrics.brier_score:.6f}"
-            )
-        else:
-            summary_line = (
-                f"Epoch {epoch}/{epochs} final | "
-                f"train_reg_loss={train_metrics.regression_loss:.6f} train_mae={train_metrics.mae:.6f} train_rmse={train_metrics.rmse:.6f} | "
-                f"test_mae={test_metrics.mae:.6f} test_rmse={test_metrics.rmse:.6f}"
-            )
-        sys.stdout.write(summary_line + "\n")
-        sys.stdout.flush()
+        if verbose:
+            if model_type == "classifier":
+                summary_line = (
+                    f"Epoch {epoch}/{epochs} final | "
+                    f"train_class_loss={train_metrics.classification_loss:.6f} train_acc={train_metrics.accuracy:.6f} train_f1={train_metrics.f1_score:.6f} train_brier={train_metrics.brier_score:.6f} | "
+                    f"test_acc={test_metrics.accuracy:.6f} test_f1={test_metrics.f1_score:.6f} test_brier={test_metrics.brier_score:.6f}"
+                )
+            else:
+                summary_line = (
+                    f"Epoch {epoch}/{epochs} final | "
+                    f"train_reg_loss={train_metrics.regression_loss:.6f} train_mae={train_metrics.mae:.6f} train_rmse={train_metrics.rmse:.6f} | "
+                    f"test_mae={test_metrics.mae:.6f} test_rmse={test_metrics.rmse:.6f}"
+                )
+            sys.stdout.write(summary_line + "\n")
+            sys.stdout.flush()
 
         scheduler.step(test_metrics.loss)
 
-        history.append(
-            {
-                "epoch": epoch,
-                "train": asdict(train_metrics),
-                "test": asdict(test_metrics),
-                "validation": asdict(validation_metrics),
-            }
-        )
+        history.append({
+            "epoch": epoch,
+            "train": asdict(train_metrics),
+            "test": asdict(test_metrics),
+            "validation": asdict(validation_metrics),
+        })
 
         if (test_metrics.loss < best_test_performance and model_type == "classifier") or (model_type == "regressor" and test_metrics.mae < best_test_performance):
             best_test_performance = test_metrics.loss if model_type == "classifier" else test_metrics.mae
@@ -684,7 +676,6 @@ def train_model(
                     checkpoint_path,
                 )
         else:
-            # Overfitting: loss de treino continuou caindo, mas a de validação não
             if train_metrics.loss < test_metrics.loss:
                 patience_counter += 1
 
@@ -707,34 +698,21 @@ def train_model(
     validation_predictions_path = Path(validation_predictions_path)
     validation_predictions_path.parent.mkdir(parents=True, exist_ok=True)
     validation_predictions = _collect_validation_predictions(
-        model=model,
-        arch=arch,
-        model_type=model_type,
-        validation_dataframe=validation_dataframe,
-        validation_loader=bundle.validation_loader,
-        numerical_feature_columns=bundle.numerical_feature_columns,
-        categorical_feature_columns=bundle.categorical_feature_columns,
-        sequence_length=sequence_length,
-        device=runtime_device,
+        model=model, arch=arch, model_type=model_type,
+        validation_dataframe=validation_dataframe, validation_loader=bundle.validation_loader,
+        numerical_feature_columns=bundle.numerical_feature_columns, categorical_feature_columns=bundle.categorical_feature_columns,
+        sequence_length=sequence_length, device=runtime_device,
     )
     validation_predictions.to_csv(validation_predictions_path, index=False)
 
     test_metrics = _compute_epoch_metrics(
-        model=model,
-        arch=arch,
-        model_type=model_type,
-        loader=bundle.test_loader,
-        device=runtime_device,
-        criterion=criterion,
+        model=model, arch=arch, model_type=model_type,
+        loader=bundle.test_loader, device=runtime_device, criterion=criterion,
     )
 
     validation_metrics = _compute_epoch_metrics(
-        model=model,
-        arch=arch,
-        model_type=model_type,
-        loader=bundle.validation_loader,
-        device=runtime_device,
-        criterion=criterion,
+        model=model, arch=arch, model_type=model_type,
+        loader=bundle.validation_loader, device=runtime_device, criterion=criterion,
     )
 
     result: dict[str, Any] = {
