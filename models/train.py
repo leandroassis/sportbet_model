@@ -877,6 +877,11 @@ def main() -> None:
         default=1.5,
         help='Fator de Temperature Scaling (>1.0 reduz hiperconfiança)'
     )
+    parser.add_argument('--online_learning', action='store_true', help='Ativa o fine-tuning Walk-Forward durante a validação.')
+    parser.add_argument('--online_lr', type=float, default=1e-5, help='Learning rate conservadora para o fine-tuning (default: 1e-5).')
+    parser.add_argument('--catboost_iterations', type=int, default=1000, help='Número máximo de iterações para o CatBoost (default: 1000).')
+    parser.add_argument('--catboost_depth', type=int, default=6, help='Profundidade máxima das árvores do CatBoost (default: 6).')
+    parser.add_argument('--catboost_od_wait', type=int, default=50, help='Número de iterações para espera de early stopping no CatBoost (default: 50).')
 
     args = parser.parse_args()
     results_name = f"respostas_{args.arch}.csv"
@@ -938,15 +943,15 @@ def main() -> None:
         
         # 4. Treina o CatBoost
         catboost_model_final = CatBoostClassifier(
-            iterations=3000,
+            iterations=args.catboost_iterations,
             learning_rate=0.01,
-            depth=3,
+            depth=args.catboost_depth,
             loss_function='MultiCrossEntropy',
             eval_metric='MultiCrossEntropy',
             #'class_weights': [1.25, 0.75, 1.4],
             use_best_model=True,
             od_type='Iter',
-            od_wait=150,
+            od_wait=args.catboost_od_wait,
             verbose=2
         )
         catboost_model_final.fit(X_train, y_train, eval_set=(X_val, y_val))
@@ -972,6 +977,21 @@ def main() -> None:
         validation_dataframe['AvgCD'] = original_odds.loc[validation_dataframe.index, 'AvgCD']
         validation_dataframe['AvgCA'] = original_odds.loc[validation_dataframe.index, 'AvgCA']
 
+        # Inicialização do Otimizador de Fine-Tuning
+        if args.online_learning:
+            from train import RPSLoss
+            # Só cria o otimizador se houver parâmetros treináveis (Hybrid congela a Siamese)
+            trainable_params = [p for p in pytorch_model_final.parameters() if p.requires_grad]
+            if trainable_params:
+                finetune_optimizer = torch.optim.AdamW(trainable_params, lr=args.online_lr, weight_decay=1e-5)
+                finetune_criterion = RPSLoss() if args.model_type == "classifier" else torch.nn.PoissonNLLLoss(log_input=False)
+            else:
+                finetune_optimizer = None
+                finetune_criterion = None
+        else:
+            finetune_optimizer = None
+            finetune_criterion = None
+
         # Initialize financial analyzer with validation data only
         analyzer = FinancialAnalyzer(
             validation_dataframe=validation_dataframe,
@@ -989,6 +1009,9 @@ def main() -> None:
             ev_threshold=args.ev_threshold,
             betting_unit=args.betting_unit,
             temperature=args.temperature,
+            online_learning=args.online_learning,     
+            optimizer=finetune_optimizer,             
+            criterion=finetune_criterion              
         )
 
         financial_results = analyzer.run()

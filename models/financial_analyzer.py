@@ -79,7 +79,11 @@ class FinancialAnalyzer:
         betting_unit: float = 1.0,
         temperature: float = 1.0,
         catboost_model = None,
-        verbose: bool = True
+        verbose: bool = True,
+        # --- PARÂMETROS DE ONLINE LEARNING ---
+        online_learning: bool = False,
+        optimizer: torch.optim.Optimizer = None,
+        criterion: torch.nn.Module = None
     ):
         self.validation_dataframe = validation_dataframe
         self.model = model
@@ -97,6 +101,10 @@ class FinancialAnalyzer:
         self.ev_threshold = ev_threshold
         self.betting_unit = betting_unit
         self.temperature = temperature
+        
+        self.online_learning = online_learning
+        self.optimizer = optimizer
+        self.criterion = criterion
 
         self.output_dir = Path(output_dir) if output_dir else Path(__file__).parent
         self.data_dir = self.output_dir / 'data'
@@ -105,7 +113,7 @@ class FinancialAnalyzer:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.plots_dir.mkdir(parents=True, exist_ok=True)
 
-        self.df_predictions = None  # Inicialização de variável importante
+        self.df_predictions = None
 
         self._validate_odds_sanity()
 
@@ -134,11 +142,18 @@ class FinancialAnalyzer:
         for col in self.PRED_COL_NAMES:
             df_with_preds[col] = np.nan
 
-        self.model.eval()
         all_outputs_list = []
+        
+        if self.online_learning and self.verbose:
+            print("Modo Walk-Forward (Online Learning) Ativado: O modelo aprenderá com os resultados em tempo real.")
 
-        with torch.no_grad():
-            for batch in self.validation_loader:
+        for batch in self.validation_loader:
+            
+            # ========================================================
+            # FASE 1: PREVISÃO (CÉGO PARA O RESULTADO)
+            # ========================================================
+            self.model.eval()
+            with torch.no_grad():
                 if self.arch in ['siamese', 'hybrid']:
                     (h_num, h_cat, a_num, a_cat, m_num, m_cat), targets, _ = batch
                     outputs = self.model(
@@ -156,10 +171,13 @@ class FinancialAnalyzer:
                             
                         if expected_features > emb_np.shape[1]:
                             m_num_np = m_num.cpu().numpy()
-                            full_features = np.hstack([m_num_np, emb_np])
-                            all_outputs_list.append(full_features)
+                            batch_features = np.hstack([m_num_np, emb_np])
                         else:
-                            all_outputs_list.append(emb_np)
+                            batch_features = emb_np
+                            
+                        batch_probs = self.catboost_model.predict_proba(batch_features)
+                        all_outputs_list.append(batch_probs)
+                        
                     else:
                         if self.model_type == 'classifier':
                             probs = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
@@ -171,17 +189,53 @@ class FinancialAnalyzer:
                         probs = torch.nn.functional.softmax(outputs, dim=1).cpu().numpy()
                         all_outputs_list.append(probs)
 
-        matrix_features = np.vstack(all_outputs_list)
+            # ========================================================
+            # FASE 2: ONLINE LEARNING (ATUALIZAÇÃO COM O RESULTADO REAL)
+            # ========================================================
+            if self.online_learning:
+                # 2A. Atualiza a Rede PyTorch (Siamese, MLP, Legacy)
+                # Bloqueio crítico: A arquitetura 'hybrid' usa um extrator congelado (128 dims), ignoramos o RPSLoss.
+                if self.optimizer is not None and self.criterion is not None and self.arch != 'hybrid':
+                    self.model.train()
+                    self.optimizer.zero_grad()
+                    
+                    if self.arch == 'siamese':
+                        out_update = self.model(
+                            h_num.to(self.device), h_cat.to(self.device),
+                            a_num.to(self.device), a_cat.to(self.device),
+                            m_num.to(self.device), m_cat.to(self.device)
+                        )
+                    else:
+                        out_update = self.model(numerical_feat.to(self.device), categorical_feat.to(self.device))
+                        
+                    loss = self.criterion(out_update, targets.to(self.device))
+                    loss.backward()
+                    self.optimizer.step()
+                
+                # 2B. Atualiza a Árvore CatBoost (Hybrid)
+                if self.arch == 'hybrid' and self.catboost_model is not None:
+                    try:
+                        y_cat = targets.cpu().numpy()
+                        loss_fn = self.catboost_model.get_param('loss_function')
+                        
+                        if 'MultiClass' in loss_fn and y_cat.ndim > 1:
+                            y_cat = np.argmax(y_cat, axis=1)
+                            
+                        # Micro-ajuste Walk-Forward
+                        self.catboost_model.fit(
+                            batch_features, y_cat,
+                            init_model=self.catboost_model,
+                            iterations=1, 
+                            verbose=False
+                        )
+                    except Exception:
+                        pass # Suprime falhas em lotes residuais mínimos
 
-        if self.arch == 'hybrid' and self.catboost_model is not None:
-            if self.verbose: print("Executando inferência combinada através do modelo CatBoost...")
-            final_probabilities = self.catboost_model.predict_proba(matrix_features)
-        else:
-            final_probabilities = matrix_features
+        final_probabilities = np.vstack(all_outputs_list)
 
         if len(final_probabilities) < len(df_with_preds):
             diff = len(df_with_preds) - len(final_probabilities)
-            if self.verbose: print(f"⚠️ Alinhamento ativado: Removendo {diff} partidas de warm-up...")
+            if self.verbose: print(f"Alinhamento ativado: Removendo {diff} partidas de warm-up...")
             try:
                 from dataloader import YEAR_COLUMN
                 valid_indices = []
@@ -254,35 +308,47 @@ class FinancialAnalyzer:
         )
 
     def simulate_flat_betting(self, df: pd.DataFrame, predictions: np.ndarray, predictions_prob: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, float, float, int, int, float]:
-        """Simula flat betting (sempre aposta)."""
+        """Simula flat betting (aposta na opção com Maior EV)."""
         pl_series = np.zeros(len(df))
         ev_series = np.zeros(len(df))
+        bets_won = 0
 
         classe_real = (df[self.TARGET_COLS].values @ np.array([0, 1, 2])).astype(int)
 
         for idx in range(len(df)):
-            classe_predita = predictions[idx]
-            odd_coluna = self.ODDS_COLS[classe_predita]
-            
-            # A coluna no DataFrame já é a Odd Decimal real (ex: 1.85, 3.20)
-            odd_aposta = df.iloc[idx].get(odd_coluna, np.nan)
+            if predictions_prob is not None:
+                # ESTRATÉGIA DO MODELO: Buscar o MAIOR EV entre as 3 opções (0, 1, 2)
+                evs = []
+                for c in range(3):
+                    odd_c = df.iloc[idx].get(self.ODDS_COLS[c], np.nan)
+                    if np.isnan(odd_c) or odd_c <= 1.0:
+                        evs.append(-np.inf)
+                    else:
+                        evs.append((predictions_prob[idx][c] * odd_c) - 1.0)
+                
+                # A classe escolhida passa a ser a que dá mais lucro a longo prazo!
+                classe_predita = np.argmax(evs)
+                odd_aposta = df.iloc[idx].get(self.ODDS_COLS[classe_predita], np.nan)
+                ev_calc = evs[classe_predita]
+            else:
+                # ESTRATÉGIA BASELINE: Segue a predição da casa (geralmente o favorito/menor odd)
+                classe_predita = predictions[idx]
+                odd_aposta = df.iloc[idx].get(self.ODDS_COLS[classe_predita], np.nan)
+                
+                # EV teórico da Baseline (usamos 1/Odd como proxy de probabilidade)
+                prob_implicita = 1.0 / odd_aposta if not np.isnan(odd_aposta) and odd_aposta > 0 else 0.0
+                ev_calc = (prob_implicita * odd_aposta) - 1.0 if not np.isnan(odd_aposta) else 0.0
 
-            if np.isnan(odd_aposta) or odd_aposta <= 1.0:
+            if np.isnan(odd_aposta) or odd_aposta <= 1.0 or ev_calc == -np.inf:
                 pl_series[idx] = 0.0
                 ev_series[idx] = 0.0
             else:
-                prob_col = self.PRED_COL_NAMES[classe_predita]
-                if self.catboost_model is None or predictions_prob is None:
-                    prob_predita = df.iloc[idx][prob_col]
-                else:
-                    prob_predita = predictions_prob[idx][classe_predita]
-
-                # Cálculo do EV real: (Probabilidade do Modelo * Odd) - 1
-                ev_series[idx] = (prob_predita * odd_aposta) - 1.0
-
-                # Cálculo de P&L real
+                ev_series[idx] = ev_calc
+                
+                # Verificação de lucro ou prejuízo da aposta escolhida
                 if classe_predita == classe_real[idx]:
                     pl_series[idx] = self.betting_unit * (odd_aposta - 1.0)
+                    bets_won += 1
                 else:
                     pl_series[idx] = -self.betting_unit
 
@@ -290,14 +356,13 @@ class FinancialAnalyzer:
         final_balance = cumsum_pl[-1] if len(cumsum_pl) > 0 else 0.0
         avg_ev = np.mean(ev_series[~np.isnan(ev_series)])
         bets_placed = len(df)
-        bets_won = np.sum(predictions == classe_real)
         yield_roi = (final_balance / (bets_placed * self.betting_unit) * 100) if bets_placed > 0 else 0.0
 
         return pl_series, cumsum_pl, final_balance, avg_ev, bets_placed, bets_won, yield_roi
 
 
     def simulate_value_betting(self, df: pd.DataFrame, predictions: np.ndarray, predictions_prob: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, float, float, int, int, float]:
-        """Simula value betting: aposta apenas quando EV > threshold."""
+        """Simula value betting: aposta na opção com Maior EV apenas quando EV > threshold."""
         pl_series = np.zeros(len(df))
         ev_apostas_realizadas = []
         bets_placed = 0
@@ -306,29 +371,36 @@ class FinancialAnalyzer:
         classe_real = (df[self.TARGET_COLS].values @ np.array([0, 1, 2])).astype(int)
 
         for idx in range(len(df)):
-            classe_predita = predictions[idx]
-            odd_coluna = self.ODDS_COLS[classe_predita]
-            
-            # A coluna no DataFrame já é a Odd Decimal real
-            odd_aposta = df.iloc[idx].get(odd_coluna, np.nan)
+            if predictions_prob is not None:
+                # ESTRATÉGIA DO MODELO: Buscar o MAIOR EV entre as 3 opções
+                evs = []
+                for c in range(3):
+                    odd_c = df.iloc[idx].get(self.ODDS_COLS[c], np.nan)
+                    if np.isnan(odd_c) or odd_c <= 1.0:
+                        evs.append(-np.inf)
+                    else:
+                        evs.append((predictions_prob[idx][c] * odd_c) - 1.0)
+                
+                classe_predita = np.argmax(evs)
+                odd_aposta = df.iloc[idx].get(self.ODDS_COLS[classe_predita], np.nan)
+                ev_calc = evs[classe_predita]
+            else:
+                # ESTRATÉGIA BASELINE: Segue a predição da casa
+                classe_predita = predictions[idx]
+                odd_aposta = df.iloc[idx].get(self.ODDS_COLS[classe_predita], np.nan)
+                
+                prob_implicita = 1.0 / odd_aposta if not np.isnan(odd_aposta) and odd_aposta > 0 else 0.0
+                ev_calc = (prob_implicita * odd_aposta) - 1.0 if not np.isnan(odd_aposta) else 0.0
 
-            if np.isnan(odd_aposta) or odd_aposta <= 1.0:
+            if np.isnan(odd_aposta) or odd_aposta <= 1.0 or ev_calc == -np.inf:
                 pl_series[idx] = 0.0
             else:
-                prob_col = self.PRED_COL_NAMES[classe_predita]
-                if self.catboost_model is None or predictions_prob is None:
-                    prob_predita = df.iloc[idx][prob_col]
-                else:
-                    prob_predita = predictions_prob[idx][classe_predita]
-
-                # EV Matemático
-                ev = (prob_predita * odd_aposta) - 1.0
-
-                should_bet = (ev >= self.ev_threshold)
+                # Filtro principal do Value Betting
+                should_bet = (ev_calc >= self.ev_threshold)
 
                 if should_bet:
                     bets_placed += 1
-                    ev_apostas_realizadas.append(ev)
+                    ev_apostas_realizadas.append(ev_calc)
 
                     if classe_predita == classe_real[idx]:
                         pl_series[idx] = self.betting_unit * (odd_aposta - 1.0)

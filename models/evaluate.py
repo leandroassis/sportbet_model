@@ -9,6 +9,9 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 
+import torch.nn as nn
+import torch
+
 # Importações do ecossistema do seu projeto
 from dataloader import load_match_dataframe, split_match_dataframe
 from financial_analyzer import FinancialAnalyzer
@@ -46,6 +49,11 @@ def main():
     parser.add_argument("--betting_unit", type=float, default=10.0)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--verbose', action='store_true', help="Exibe detalhes adicionais durante a avaliação financeira.")
+    parser.add_argument('--online_learning', action='store_true', help='Ativa o fine-tuning Walk-Forward durante a validação.')
+    parser.add_argument('--online_lr', type=float, default=1e-5, help='Learning rate conservadora para o fine-tuning.')
+    parser.add_argument('--catboost_iterations', type=int, default=1000, help='Número máximo de iterações para o CatBoost (default: 1000).')
+    parser.add_argument('--catboost_depth', type=int, default=6, help='Profundidade máxima das árvores do CatBoost (default: 6).')
+    parser.add_argument('--catboost_od_wait', type=int, default=50, help='Número de iterações para espera de early stopping no CatBoost (default: 50).')
 
     args = parser.parse_args()
 
@@ -96,9 +104,9 @@ def main():
             X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, device, one_hot_encoded=False)
             
             catboost_model_final = CatBoostClassifier(
-                iterations=3000, learning_rate=0.01, depth=3,
+                iterations=args.catboost_iterations, learning_rate=0.01, depth=args.catboost_depth,
                 loss_function='MultiCrossEntropy', eval_metric='MultiCrossEntropy',
-                use_best_model=True, od_type='Iter', od_wait=150, 
+                use_best_model=True, od_type='Iter', od_wait=args.catboost_od_wait, 
                 verbose=0  # <-- CATBOOST SILENCIOSO
             )
             catboost_model_final.fit(X_train, y_train, eval_set=(X_val, y_val))
@@ -110,6 +118,21 @@ def main():
         validation_dataframe['AvgCH'] = original_odds.loc[validation_dataframe.index, 'AvgCH']
         validation_dataframe['AvgCD'] = original_odds.loc[validation_dataframe.index, 'AvgCD']
         validation_dataframe['AvgCA'] = original_odds.loc[validation_dataframe.index, 'AvgCA']
+
+        # Inicialização do Otimizador de Fine-Tuning
+        if args.online_learning:
+            from train import RPSLoss
+            # Só cria o otimizador se houver parâmetros treináveis (Hybrid congela a Siamese)
+            trainable_params = [p for p in pytorch_model_final.parameters() if p.requires_grad]
+            if trainable_params:
+                finetune_optimizer = torch.optim.AdamW(trainable_params, lr=args.online_lr, weight_decay=1e-5)
+                finetune_criterion = RPSLoss() if args.model_type == "classifier" else torch.nn.PoissonNLLLoss(log_input=False)
+            else:
+                finetune_optimizer = None
+                finetune_criterion = None
+        else:
+            finetune_optimizer = None
+            finetune_criterion = None
 
         # 4. Avaliação Financeira
         analyzer = FinancialAnalyzer(
@@ -127,7 +150,10 @@ def main():
             ev_threshold=args.ev_threshold,
             betting_unit=args.betting_unit,
             temperature=args.temperature,
-            verbose=args.verbose
+            verbose=args.verbose,
+            online_learning=args.online_learning,
+            optimizer=finetune_optimizer,
+            criterion=finetune_criterion
         )
         
         results = analyzer.run()
