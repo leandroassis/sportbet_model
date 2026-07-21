@@ -18,6 +18,19 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=FutureWarning, message=".*torch.cuda.amp.*")
 
+
+def resolve_csv_path(csv_path: str | Path) -> Path:
+    candidate = Path(csv_path).expanduser()
+    if candidate.exists():
+        return candidate
+
+    fallback = Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv"
+    if fallback.exists():
+        print(f"Aviso: CSV nao encontrado em {candidate}. Usando {fallback}.")
+        return fallback
+
+    return candidate
+
 try:
     from .dataloader import (
         FEATURE_COLUMNS,
@@ -177,7 +190,7 @@ except ImportError:
     from SiameseHybrid import SiameseHybridClassifier, SiameseEmbeddingExtractor
 
 from catboost import CatBoostClassifier
-from SiameseHybrid import SiameseEmbeddingExtractor
+from SiameseHybrid import CatBoostOrdinalWrapper, SiameseEmbeddingExtractor
 # Certifique-se de que load_match_dataframe está importado do dataloader
 from dataloader import load_match_dataframe
 
@@ -874,7 +887,7 @@ def main() -> None:
     parser.add_argument(
         '--temperature',
         type=float,
-        default=1.5,
+        default=1.0,
         help='Fator de Temperature Scaling (>1.0 reduz hiperconfiança)'
     )
     parser.add_argument('--online_learning', action='store_true', help='Ativa o fine-tuning Walk-Forward durante a validação.')
@@ -882,12 +895,15 @@ def main() -> None:
     parser.add_argument('--catboost_iterations', type=int, default=1000, help='Número máximo de iterações para o CatBoost (default: 1000).')
     parser.add_argument('--catboost_depth', type=int, default=6, help='Profundidade máxima das árvores do CatBoost (default: 6).')
     parser.add_argument('--catboost_od_wait', type=int, default=50, help='Número de iterações para espera de early stopping no CatBoost (default: 50).')
+    parser.add_argument('--verbose', action='store_true', help='Exibe logs detalhados durante o treinamento e avaliação.', default=False)
 
     args = parser.parse_args()
     results_name = f"respostas_{args.arch}.csv"
     checkpoint_name = f"{args.arch}_{args.model_type}.pth"
+    csv_path = resolve_csv_path(args.csv_path)
+
     output = train_model(
-        csv_path=Path(args.csv_path),
+        csv_path=csv_path,
         arch=args.arch,
         model_type=args.model_type,
         epochs=args.epochs,
@@ -915,7 +931,7 @@ def main() -> None:
     print(f"Gráficos salvos em: {plots_dir}")
 
     print("Iniciando preparação para análise financeira...")
-    df_full = load_match_dataframe(args.csv_path) # Necessário para pegar as odds limpas
+    df_full = load_match_dataframe(csv_path) # Necessário para pegar as odds limpas
     device = output["device"]
     
     catboost_model_final = None
@@ -924,38 +940,29 @@ def main() -> None:
     # SE A ARQUITETURA FOR HÍBRIDA: Treina o CatBoost agora!
     if args.arch == 'hybrid':
         print("\n" + "="*50)
-        print("TREINANDO CATBOOST COM EMBEDDINGS (ABORDAGEM 2)")
+        print("TREINANDO CATBOOST COM EMBEDDINGS (MÉTODO FRANK-HALL ORDINAL)")
         print("="*50)
         
-        # 1. Recuperamos os DataFrames exatos de cada split para alinhamento das Odds
+        # 1. Recuperamos os DataFrames
         splits = split_match_dataframe(df_full)
         
-        # 2. Congela a rede PyTorch e converte num extrator
+        # 2. Extrator PyTorch
         extractor = SiameseEmbeddingExtractor(output["model"].backbone).to(device)
-        pytorch_model_final = extractor # O Analyzer usará o extrator para gerar a inferência
+        pytorch_model_final = extractor 
         
-        # 2. Constrói as matrizes X e y chamando a função com TRÊS argumentos apenas!
-        print("Extraindo features do Treino...")
-        X_train, y_train = build_catboost_dataset(output["bundle"].train_loader, extractor, device, one_hot_encoded=False)
+        print("Extraindo features do Treino e Validação...")
+        X_train, y_train = build_catboost_dataset(output["bundle"].train_loader, extractor, device, one_hot_encoded=True)
+        X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, device, one_hot_encoded=True)
         
-        print("Extraindo features da Validação...")
-        X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, device, one_hot_encoded=False)
-        
-        # 4. Treina o CatBoost
+        # Substitua o Wrapper de Frank-Hall por um classificador único e estável
         catboost_model_final = CatBoostClassifier(
-            iterations=args.catboost_iterations,
-            learning_rate=0.01,
-            depth=args.catboost_depth,
-            loss_function='MultiCrossEntropy',
-            eval_metric='MultiCrossEntropy',
-            #'class_weights': [1.25, 0.75, 1.4],
-            use_best_model=True,
-            od_type='Iter',
-            od_wait=args.catboost_od_wait,
-            verbose=2
-        )
+            iterations=args.catboost_iterations, learning_rate=0.05, depth=args.catboost_depth,
+            loss_function='MultiClass',
+            eval_metric='TotalF1', 
+            use_best_model=True, od_type='Iter', od_wait=args.catboost_od_wait, verbose=args.verbose
+        )  
         catboost_model_final.fit(X_train, y_train, eval_set=(X_val, y_val))
-        print("Treinamento do CatBoost concluído!")
+        print("\nTreinamento do CatBoost Ordinal concluído!")
 
     # Run integrated financial analysis
     print("\n" + "="*80)
@@ -965,7 +972,7 @@ def main() -> None:
         device = torch.device(output["device"])
 
         # Load original odds from raw CSV (antes de passar por scale_features)
-        original_dataframe = load_match_dataframe(Path(args.csv_path))
+        original_dataframe = load_match_dataframe(csv_path)
         original_odds = original_dataframe[['AvgCH', 'AvgCD', 'AvgCA']].copy()
 
         # Get validation dataframe with scaled features

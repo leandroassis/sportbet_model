@@ -57,13 +57,24 @@ class SiameseEmbeddingExtractor(nn.Module):
 
 class CatBoostOrdinalWrapper:
     """
-    Wrapper que encapsula dois modelos CatBoost binários para realizar 
-    Classificação Ordinal (Frank-Hall), otimizando diretamente o RPS.
-    Mantém a interface predict_proba para o FinancialAnalyzer.
+    Wrapper Frank-Hall para Classificação Ordinal.
+    Finge ser um CatBoost nativo para que o FinancialAnalyzer consiga extrair
+    parâmetros e realizar o Online Learning sem quebrar.
     """
     def __init__(self, model_m1, model_m2):
         self.model_m1 = model_m1
         self.model_m2 = model_m2
+
+    @property
+    def feature_names_(self):
+        # Engana a Inteligência Dinâmica do Analyzer para o alinhamento de colunas
+        return self.model_m1.feature_names_
+
+    def get_param(self, param_name):
+        # Retorna o parâmetro do M1, assumindo que M2 é simétrico
+        if param_name == 'loss_function':
+            return 'Logloss' # Força Logloss binária
+        return self.model_m1.get_param(param_name)
 
     def predict_proba(self, X):
         # M1 prevê a probabilidade de ser Mandante
@@ -82,6 +93,23 @@ class CatBoostOrdinalWrapper:
         prob_empate = p2 - p1
         prob_visitante = 1.0 - p2
 
-        # Retorna na ordem exata que o FinancialAnalyzer exige: [Empate(0), Mandante(1), Visitante(2)]
-        probs = np.column_stack((prob_empate, prob_mandante, prob_visitante))
-        return probs
+        # Retorna na ordem exata: [Empate(0), Mandante(1), Visitante(2)]
+        return np.column_stack((prob_empate, prob_mandante, prob_visitante))
+
+    def fit(self, X, y, init_model=None, iterations=1, verbose=False):
+        """
+        Método invocado pelo Online Learning.
+        Recebe o target real do jogo (0, 1, ou 2) e o converte em tempo real 
+        para os dois alvos binários das árvores.
+        """
+        # Se y vier como One-Hot encoding, converte para índice
+        if y.ndim > 1:
+            y = np.argmax(y, axis=1)
+
+        # Conversão Frank-Hall
+        y_m1 = (y == 1).astype(int)           # 1 se Mandante, 0 caso contrário
+        y_m2 = np.isin(y, [0, 1]).astype(int) # 1 se Mandante ou Empate, 0 se Visitante
+
+        # Atualiza os dois modelos com a nova linha de dados
+        self.model_m1.fit(X, y_m1, init_model=self.model_m1, iterations=iterations, verbose=verbose)
+        self.model_m2.fit(X, y_m2, init_model=self.model_m2, iterations=iterations, verbose=verbose)

@@ -116,17 +116,21 @@ def run_xgboost_pruning(csv_path: str):
     # ==========================================
     
     # Plotagem Visual com destaque para a variável sombra
-    plt.figure(figsize=(12, 10))
+    plt.figure(figsize=(14, 6))
     # Define as cores: destaca a sombra de vermelho
     colors = ['red' if feat == shadow_feature_name else 'royalblue' for feat in importance_df['Feature']]
-    
+
+    # Plota barras verticais: eixo x -> Features, eixo y -> Importance
     sns.barplot(
-        x='Importance', 
-        y='Feature', 
+        x='Feature',
+        y='Importance',
         data=importance_df,
         palette=colors,
     )
     plt.title('Feature Importance (Variável Sombra em Vermelho)')
+    plt.xticks(rotation=90)
+    plt.ylabel('Importance')
+    plt.xlabel('Feature')
     plt.tight_layout()
     plt.savefig('plots/xgboost_feature_importance.png')
     print("\nGráfico salvo como 'plots/xgboost_feature_importance.png'")

@@ -25,6 +25,19 @@ except ImportError:
     CATBOOST_AVAILABLE = False
 
 
+def resolve_csv_path(csv_path: str | Path) -> Path:
+    candidate = Path(csv_path).expanduser()
+    if candidate.exists():
+        return candidate
+
+    fallback = Path(__file__).resolve().parents[1] / "data" / "dataset_preprocessed.csv"
+    if fallback.exists():
+        print(f"Aviso: CSV nao encontrado em {candidate}. Usando {fallback}.")
+        return fallback
+
+    return candidate
+
+
 def main():
     parser = argparse.ArgumentParser(description="Avaliação de Robustez Financeira (N Iterações)")
     
@@ -58,7 +71,8 @@ def main():
     args = parser.parse_args()
 
     # Preparações
-    df_full = load_match_dataframe(Path(args.csv_path))
+    csv_path = resolve_csv_path(args.csv_path)
+    df_full = load_match_dataframe(csv_path)
     device = get_device(None)
 
     all_results = []
@@ -74,7 +88,7 @@ def main():
         
         # 1. Treinamento da Rede Base
         output = train_model(
-            csv_path=Path(args.csv_path),
+            csv_path=csv_path,
             arch=args.arch,
             model_type=args.model_type,
             epochs=args.epochs,
@@ -89,7 +103,7 @@ def main():
             best_model_path=None,
             validation_predictions_path=Path(__file__).resolve().parents[0] / f"results/respostas_iter_{i}.csv",
             early_stopping_patience=args.early_stopping_patience,
-            verbose=False  # <-- SUPRIME O TERMINAL DURANTE O TREINO
+            verbose=False
         )
         
         pytorch_model_final = output["model"]
@@ -97,20 +111,22 @@ def main():
 
         # 2. Tratamento do CatBoost se a Arquitetura for Hybrid
         if args.arch == 'hybrid' and CATBOOST_AVAILABLE:
+            from SiameseHybrid import CatBoostOrdinalWrapper # Garanta a importação!
+            
             extractor = SiameseEmbeddingExtractor(output["model"].backbone).to(device)
             pytorch_model_final = extractor
             
-            X_train, y_train = build_catboost_dataset(output["bundle"].train_loader, extractor, device, one_hot_encoded=False)
-            X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, device, one_hot_encoded=False)
+            X_train, y_train = build_catboost_dataset(output["bundle"].train_loader, extractor, device, one_hot_encoded=True)
+            X_val, y_val = build_catboost_dataset(output["bundle"].validation_loader, extractor, device, one_hot_encoded=True)
             
+            # Substitua o Wrapper de Frank-Hall por um classificador único e estável
             catboost_model_final = CatBoostClassifier(
-                iterations=args.catboost_iterations, learning_rate=0.01, depth=args.catboost_depth,
-                loss_function='MultiCrossEntropy', eval_metric='MultiCrossEntropy',
-                use_best_model=True, od_type='Iter', od_wait=args.catboost_od_wait, 
-                verbose=0  # <-- CATBOOST SILENCIOSO
-            )
+                iterations=args.catboost_iterations, learning_rate=0.05, depth=args.catboost_depth,
+                loss_function='MultiClass',
+                eval_metric='TotalF1', 
+                use_best_model=True, od_type='Iter', od_wait=args.catboost_od_wait, verbose=args.verbose
+            )  
             catboost_model_final.fit(X_train, y_train, eval_set=(X_val, y_val))
-
         # 3. Restaura as Odds originais para a matriz de Validação Financeira
         original_odds = df_full[['AvgCH', 'AvgCD', 'AvgCA']].copy()
         validation_split = split_match_dataframe(df_full)
